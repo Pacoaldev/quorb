@@ -34,6 +34,7 @@ export const OFFICIAL_USAGE_URL: Record<string, string> = {
   cursor: 'https://cursor.com/dashboard?tab=usage',
   copilot: 'https://github.com/settings/billing/premium_requests_usage',
   openrouter: 'https://openrouter.ai/activity',
+  nine_router: 'http://localhost:20128/dashboard',
 };
 
 /** URL de uso oficial de un informe; normaliza el id para las cuentas adicionales (`openrouter:abc`). */
