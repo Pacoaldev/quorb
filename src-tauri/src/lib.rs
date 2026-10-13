@@ -183,6 +183,19 @@ async fn nan_probe(state: State<'_, AppState>) -> Result<String, String> {
     providers::nan::probe(&cfg.nan, &state.http).await
 }
 
+/// Guarda la contraseña del dashboard de 9Router y prueba el login; devuelve las
+/// stats en crudo (Ajustes › 9Router › Probar).
+#[tauri::command]
+async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password: String) -> Result<String, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    let base = cfg.nine_router.base_url.clone();
+    let cookie = providers::nine_router::login(&state.http, &base, &password).await?;
+    secrets::set(secrets::NINE_ROUTER_PASSWORD, &password)?;
+    secrets::set(secrets::NINE_ROUTER_SESSION, &cookie)?;
+    let _ = app.emit("config-changed", ());
+    providers::nine_router::probe(&state.http, &cfg.nine_router).await
+}
+
 /// NaN: envía el enlace de acceso al correo (mismo flujo que `nan auth login --email`).
 #[tauri::command]
 async fn nan_login_request(state: State<'_, AppState>, email: String) -> Result<(), String> {
@@ -630,6 +643,7 @@ pub fn run() {
             nan_probe,
             nan_login_request,
             nan_login_complete,
+            nine_router_login,
             play_effect,
             overlay_done,
             shortcut_errors,

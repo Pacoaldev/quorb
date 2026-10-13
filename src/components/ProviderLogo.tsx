@@ -55,6 +55,7 @@ const ALIASES: Record<string, string[]> = {
   cursor: ['cursor'],
   copilot: ['copilot', 'github-copilot', 'microsoft-copilot', 'github'],
   openrouter: ['openrouter'],
+  nine_router: ['nine_router', '9router'],
 };
 
 export function findLogo(id: string): Logo | undefined {
@@ -72,6 +73,7 @@ const MONOGRAM: Record<string, { text: string; sub?: string }> = {
   cursor: { text: 'Cu' },
   copilot: { text: 'Co' },
   openrouter: { text: 'OR' },
+  nine_router: { text: '9R' },
 };
 
 /** Las APIs de pago por uso llevan una etiqueta «API» para distinguirlas de la suscripción. */
@@ -80,7 +82,11 @@ const API_TAG = new Set(['anthropic_api', 'openai_api']);
 export function ProviderLogo({ id: rawId, name }: { id: string; name: string }) {
   const [broken, setBroken] = useState(false);
   // Las cuentas adicionales (`claude:trabajo`) llevan el logo de su proveedor.
-  const id = providerOf(rawId);
+  const provider = providerOf(rawId);
+  // Los sub-proveedores de 9Router (`nine_router:minimax-cn`) usan su propio
+  // nombre: si no, todos mostrarían el mismo monograma «9R».
+  const sub = rawId.includes(':') && provider === 'nine_router' ? rawId.split(':')[1] : null;
+  const id = sub ?? provider;
   const logo = findLogo(id);
 
   if (logo && !broken) {
@@ -101,11 +107,21 @@ export function ProviderLogo({ id: rawId, name }: { id: string; name: string }) 
     );
   }
 
-  const m = MONOGRAM[id] ?? { text: name.slice(0, 2) };
+  const m = MONOGRAM[id] ?? { text: monogramText(id) };
   return (
     <span className="logo__mono" data-len={m.text.length} aria-label={name}>
       {m.text}
       {m.sub && <small>{m.sub}</small>}
     </span>
   );
+}
+/** Monograma breve y legible a partir de un id de proveedor.
+ * `minimax-cn` -> «MC», `codebuddy-intl` -> «CI», `zed` -> «ZE», `github` -> «GH». */
+function monogramText(id: string): string {
+  const parts = id.split(/[^a-z0-9]+/i).filter(Boolean);
+  const letters =
+    parts.length > 1
+      ? parts.map((p) => p[0]).join("")
+      : (parts[0] ?? "").slice(0, 2);
+  return (letters.slice(0, 3) || "??").toUpperCase();
 }

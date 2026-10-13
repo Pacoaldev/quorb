@@ -17,8 +17,12 @@ pub const OPENROUTER_API_KEY: &str = "openrouter_api_key";
 pub const GITHUB_TOKEN: &str = "github_token";
 /// Token de Cursor pegado a mano (si no, se lee de la app).
 pub const CURSOR_TOKEN: &str = "cursor_token";
+/// Contraseña del dashboard local de 9Router (para iniciar sesión y leer su uso).
+pub const NINE_ROUTER_PASSWORD: &str = "nine_router_password";
+/// Cookie de sesión del dashboard de 9Router (`auth_token`, dura 24 h).
+pub const NINE_ROUTER_SESSION: &str = "nine_router_session";
 
-pub const ALL: [&str; 7] = [
+pub const ALL: [&str; 9] = [
     ANTHROPIC_ADMIN_KEY,
     OPENAI_ADMIN_KEY,
     NAN_API_KEY,
@@ -26,6 +30,8 @@ pub const ALL: [&str; 7] = [
     OPENROUTER_API_KEY,
     GITHUB_TOKEN,
     CURSOR_TOKEN,
+    NINE_ROUTER_PASSWORD,
+    NINE_ROUTER_SESSION,
 ];
 
 /// Secretos que usa cada proveedor (las cuentas extra guardan los suyos con sufijo).
@@ -37,6 +43,8 @@ pub fn for_provider(provider: &str) -> &'static [&'static str] {
         "anthropic_api" => &[ANTHROPIC_ADMIN_KEY],
         "openai_api" => &[OPENAI_ADMIN_KEY],
         "nan" => &[NAN_API_KEY, NAN_SESSION],
+        // La sesión (cookie) la gestiona el backend; la contraseña la introduce el usuario.
+        "nine_router" => &[NINE_ROUTER_PASSWORD, NINE_ROUTER_SESSION],
         _ => &[],
     }
 }
