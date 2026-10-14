@@ -56,11 +56,45 @@ const ALIASES: Record<string, string[]> = {
   copilot: ['copilot', 'github-copilot', 'microsoft-copilot', 'github'],
   openrouter: ['openrouter'],
   nine_router: ['nine_router', '9router'],
+  // Nombres de nodos personalizados de 9Router → logo del proveedor real.
+  zhipu: ['zhipu', 'z-ai', 'glm', 'glm-cn'],
+  'qwen-alibaba': ['qwen-alibaba', 'qwen'],
+  modelscope: ['modelscope'],
+  replicate: ['replicate'],
 };
 
 export function findLogo(id: string): Logo | undefined {
   for (const key of ALIASES[id] ?? [id]) if (LOGOS[key]) return LOGOS[key];
   return undefined;
+}
+
+/**
+ * Clave de logo de un sub-proveedor de 9Router. El nombre visible (`name`) es
+ * «9Router · <sub>»: si `<sub>` es un nodo personalizado con nombre bonito
+ * («Zhipu», «QWEN - Alibaba») se normaliza a un id de logo (`zhipu`, `qwen-alibaba`);
+ * si no, se usa el id saneado del sub-proveedor (`kiro`, `minimax-cn`).
+ */
+export function subLogoKey(rawId: string, name: string): string {
+  const raw = rawId.split(':')[1] ?? '';
+  const label = name.includes(' · ') ? name.slice(name.indexOf(' · ') + 3) : name;
+  const fromName = normalizeLogoKey(label);
+  // El nombre del nodo solo manda si aporta algo distinto del id técnico.
+  if (fromName && fromName !== normalizeLogoKey(raw) && !looksTechnical(raw)) return fromName;
+  return normalizeLogoKey(fromName || raw);
+}
+
+/** ¿Es un id técnico de nodo (uuid, `openai-compatible-…`), sin nombre legible? */
+function looksTechnical(id: string): boolean {
+  return /[0-9a-f]{8}-[0-9a-f]{4}-/i.test(id) || id.includes('compatible');
+}
+
+/** Normaliza un nombre visible a clave de logo: `QWEN - Alibaba` → `qwen-alibaba`. */
+export function normalizeLogoKey(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
 }
 
 const MONOGRAM: Record<string, { text: string; sub?: string }> = {
@@ -84,8 +118,10 @@ export function ProviderLogo({ id: rawId, name }: { id: string; name: string }) 
   // Las cuentas adicionales (`claude:trabajo`) llevan el logo de su proveedor.
   const provider = providerOf(rawId);
   // Los sub-proveedores de 9Router (`nine_router:minimax-cn`) usan su propio
-  // nombre: si no, todos mostrarían el mismo monograma «9R».
-  const sub = rawId.includes(':') && provider === 'nine_router' ? rawId.split(':')[1] : null;
+  // nombre: si no, todos mostrarían el mismo monograma «9R». Si el nombre visible
+  // es el de un nodo personalizado («Zhipu», «QWEN - Alibaba»), se busca el logo
+  // por él; si no, por el id saneado del sub-proveedor.
+  const sub = rawId.includes(':') && provider === 'nine_router' ? subLogoKey(rawId, name) : null;
   const id = sub ?? provider;
   const logo = findLogo(id);
 
