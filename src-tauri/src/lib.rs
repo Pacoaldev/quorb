@@ -235,6 +235,16 @@ async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password:
     providers::nine_router::probe(&state.http, &cfg.nine_router).await
 }
 
+/// Desconecta 9Router: borra la contraseña **y** la cookie de sesión guardadas.
+/// Con solo la contraseña borrada, la cookie seguiría dando acceso hasta caducar.
+#[tauri::command]
+fn nine_router_logout(app: AppHandle) -> Result<(), String> {
+    secrets::set(secrets::NINE_ROUTER_PASSWORD, "")?;
+    secrets::set(secrets::NINE_ROUTER_SESSION, "")?;
+    let _ = app.emit("config-changed", ());
+    Ok(())
+}
+
 /// NaN: envía el enlace de acceso al correo (mismo flujo que `nan auth login --email`).
 #[tauri::command]
 async fn nan_login_request(state: State<'_, AppState>, email: String) -> Result<(), String> {
@@ -683,6 +693,7 @@ pub fn run() {
             nan_login_request,
             nan_login_complete,
             nine_router_login,
+            nine_router_logout,
             play_effect,
             overlay_done,
             shortcut_errors,

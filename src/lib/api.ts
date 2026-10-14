@@ -79,6 +79,8 @@ export const api = {
    * las stats en crudo. La cookie de sesión la conserva el backend.
    */
   nineRouterLogin: (password: string) => invoke<string>('nine_router_login', { password }),
+  /** 9Router: desconecta borrando contraseña y cookie de sesión guardadas. */
+  nineRouterLogout: () => invoke<void>('nine_router_logout'),
   /** Rectángulo del monitor en píxeles físicos */
   playEffect: (
     kind: Exclude<Effect, 'none'>,

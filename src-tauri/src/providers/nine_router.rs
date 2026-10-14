@@ -16,10 +16,12 @@ use super::{net_error, Who};
 use crate::config::NineRouterConfig;
 use crate::model::{Daily, Kind, Meter, Spend, Status, UsageReport};
 use crate::secrets;
+use chrono::Datelike;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// Error al leer 9Router: hay que volver a iniciar sesión, o es otra cosa.
+#[derive(Debug, PartialEq)]
 pub enum RouterError {
     Expired,
     Other(String),
@@ -78,15 +80,16 @@ pub async fn login_with_saved(http: &reqwest::Client, base_url: &str) -> Result<
     Ok(Some(cookie))
 }
 
-/// `GET` con la cookie de sesión; `Expired` si 401/403.
+/// `GET` con la cookie de sesión; `Expired` si 401/403. Sin cookie (login del
+/// dashboard desactivado) se omite la cabecera.
 async fn get_json(http: &reqwest::Client, base_url: &str, path: &str, cookie: &str) -> Result<Value, RouterError> {
-    let res = http
+    let mut req = http
         .get(format!("{}{}", base_url.trim_end_matches('/'), path))
-        .header(reqwest::header::COOKIE, cookie)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await
-        .map_err(|e| RouterError::Other(net_error(e)))?;
+        .header(reqwest::header::ACCEPT, "application/json");
+    if !cookie.trim().is_empty() {
+        req = req.header(reqwest::header::COOKIE, cookie);
+    }
+    let res = req.send().await.map_err(|e| RouterError::Other(net_error(e)))?;
     match res.status().as_u16() {
         200 => res.json().await.map_err(|e| RouterError::Other(format!("respuesta no JSON: {e}"))),
         401 | 403 => Err(RouterError::Expired),
@@ -128,31 +131,98 @@ async fn get_stats(http: &reqwest::Client, base: &str, period: &str, cookie: &st
     get_json(http, base, &format!("/api/usage/stats?period={period}"), cookie).await
 }
 
+/// Fallo al obtener las stats, ya resuelto el tema de la sesión.
+#[derive(Debug, PartialEq)]
+enum StatsError {
+    /// El dashboard exige sesión y no hay contraseña guardada para renovarla.
+    NeedsLogin,
+    /// Otro error de red/servidor.
+    Other(RouterError),
+}
+
+impl StatsError {
+    /// Estado del orbe cuando falla la lectura de stats.
+    fn status(&self) -> Status {
+        match self {
+            StatsError::NeedsLogin => Status::NeedsLogin,
+            StatsError::Other(e) => status_for(e),
+        }
+    }
+}
+
+/// Lee las stats resolviendo la sesión: usa la cookie actual; si el dashboard no
+/// tiene login (sin cookie) o la sesión caducó pero hay contraseña, reintenta tras
+/// iniciar sesión. Si el servidor rechaza y no hay credenciales, pide configurarlas.
+async fn read_stats(
+    http: &reqwest::Client,
+    base: &str,
+    period: &str,
+    cookie: &mut Option<String>,
+) -> Result<Value, StatsError> {
+    // Primero con la cookie que tengamos (o sin ninguna: login desactivado).
+    let first = get_stats(http, base, period, cookie.as_deref().unwrap_or("")).await;
+    match first {
+        Ok(v) => Ok(v),
+        // El servidor exige sesión: si tenemos contraseña, iniciamos y reintentamos.
+        Err(RouterError::Expired) => match login_with_saved(http, base).await {
+            Ok(Some(c)) => {
+                *cookie = Some(c.clone());
+                get_stats(http, base, period, &c).await.map_err(StatsError::Other)
+            }
+            Ok(None) => Err(StatsError::NeedsLogin),
+            Err(e) => Err(StatsError::Other(RouterError::Other(e))),
+        },
+        Err(e) => Err(StatsError::Other(e)),
+    }
+}
+
+/// Sub-proveedor descubierto en `byProvider`.
+pub(crate) struct SubProvider {
+    /// Clave tal como la devuelve 9Router (`Kiro`, `claude`). Se usa para volver a
+    /// buscar en `byProvider`, que distingue mayúsculas; **no** se normaliza.
+    pub key: String,
+    /// id de cuenta (`nine_router:<normalizado>`): minúsculas, dígitos y guiones,
+    /// para casar con `is_account_id` y ser estable como sufijo.
+    pub account_id: String,
+    /// Nombre visible («Kiro»).
+    pub label: String,
+}
+
 /// Sub-proveedores con gasto por encima del umbral, de mayor a menor coste.
 /// Se omiten los que no llegan al mínimo (por defecto 0 $, o sea gasto > 0): la
-/// tira se llenaría de ceros. El id se usa como sufijo de cuenta
-/// (`nine_router:<id>`), así que debe casar con `is_account_id`: minúsculas,
-/// dígitos y guiones.
-fn sub_providers_from(stats: &Value, min_spend: f64) -> Vec<String> {
+/// tira se llenaría de ceros. Se conserva la clave original para poder buscar en
+/// `byProvider` (que distingue mayúsculas: `Kiro` ≠ `kiro`).
+fn sub_providers_from(stats: &Value, min_spend: f64) -> Vec<SubProvider> {
     let threshold = if min_spend.is_finite() { min_spend.max(0.0) } else { 0.0 };
     let mut entries: Vec<(String, f64)> = stats
         .get("byProvider")
         .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .map(|(id, v)| {
-                    let cost = v.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
-                    (id.trim().to_ascii_lowercase(), cost)
-                })
-                .collect()
-        })
+        .map(|m| m.iter().map(|(id, v)| (id.trim().to_string(), v.get("cost").and_then(Value::as_f64).unwrap_or(0.0))).collect())
         .unwrap_or_default();
-    entries.retain(|(id, cost)| {
+    entries.retain(|(key, cost)| {
         // Estrictamente por encima del umbral: con 0 se exige algo de gasto.
-        *cost > threshold && !id.is_empty() && crate::config::is_account_id(&format!("nine_router:{id}"))
+        let account_id = format!("nine_router:{}", normalize_sub_id(key));
+        *cost > threshold && !key.is_empty() && crate::config::is_account_id(&account_id)
     });
     entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    entries.into_iter().map(|(id, _)| id).collect()
+    entries
+        .into_iter()
+        .map(|(key, _)| {
+            let account_id = format!("nine_router:{}", normalize_sub_id(&key));
+            let label = if key.is_empty() { account_id.clone() } else { key.clone() };
+            SubProvider { key, account_id, label }
+        })
+        .collect()
+}
+
+/// Sufijo de cuenta para un sub-proveedor: minúsculas, y todo lo que no sea
+/// `[a-z0-9-]` pasa a guion (p. ej. nodos personalizados con espacios).
+fn normalize_sub_id(key: &str) -> String {
+    key.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' { c } else { '-' })
+        .collect()
 }
 
 /// Informe del proveedor agregador (o de uno de sus sub-proveedores si `who` es extra).
@@ -178,53 +248,44 @@ pub async fn fetch_all(cfg: &NineRouterConfig, http: &reqwest::Client) -> Vec<Us
     let main_report = main_who.report("9Router", Kind::Api);
     let base = cfg.base_url.trim_end_matches('/');
 
-    // Sesión: guardada, o login con la contraseña configurada.
+    // Sesión: guardada, o login con la contraseña configurada. Si no hay ninguna,
+    // probamos a leer sin cookie: el login del dashboard puede estar desactivado.
     let mut cookie = match secrets::get(secrets::NINE_ROUTER_SESSION) {
-        Some(c) => c,
+        Some(c) => Some(c),
         None => match login_with_saved(http, base).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                return vec![main_report.fail(
-                    Status::Unconfigured,
-                    "Configura la contraseña del dashboard de 9Router en Ajustes.",
-                )]
-            }
+            Ok(c) => c,
             Err(e) => return vec![main_report.fail(Status::Error, e)],
         },
     };
 
-    let stats = match get_stats(http, base, &cfg.period, &cookie).await {
+    let stats = match read_stats(http, base, &cfg.period, &mut cookie).await {
         Ok(v) => v,
-        Err(RouterError::Expired) => match login_with_saved(http, base).await {
-            Ok(Some(c)) => {
-                cookie = c;
-                match get_stats(http, base, &cfg.period, &cookie).await {
-                    Ok(v) => v,
-                    Err(e) => return vec![main_report.fail(status_for(&e), e.message())],
-                }
-            }
-            Ok(None) => {
-                return vec![main_report.fail(Status::NeedsLogin, "La sesión de 9Router caducó y no hay contraseña guardada.")]
-            }
-            Err(e) => return vec![main_report.fail(Status::Error, e)],
-        },
-        Err(e) => return vec![main_report.fail(status_for(&e), e.message())],
+        Err(e) => {
+            let status = e.status();
+            let message = match e {
+                StatsError::NeedsLogin => "La sesión de 9Router caducó y no hay contraseña guardada.".to_string(),
+                StatsError::Other(err) => err.message(),
+            };
+            return vec![main_report.fail(status, message)];
+        }
     };
 
     // Serie opcional para el historial; si falla, seguimos sin ella.
-    let chart = get_json(http, base, &format!("/api/usage/chart?period={}", cfg.period), &cookie).await.ok();
+    let chart = get_json(http, base, &format!("/api/usage/chart?period={}", cfg.period), cookie.as_deref().unwrap_or(""))
+        .await
+        .ok();
 
     let mut out = vec![build_main(cfg, &main_report, &stats, chart.as_ref())];
     if cfg.show_sub_providers {
-        for name in sub_providers_from(&stats, cfg.min_spend_usd) {
+        for sub in sub_providers_from(&stats, cfg.min_spend_usd) {
             let account = crate::config::Account {
-                id: format!("nine_router:{name}"),
+                id: sub.account_id.clone(),
                 provider: "nine_router".into(),
-                label: name.clone(),
+                label: sub.label.clone(),
                 enabled: true,
                 ..Default::default()
             };
-            out.push(build_sub(&Who::extra(&account).report("9Router", Kind::Api), &stats, &name, chart.as_ref()));
+            out.push(build_sub(&Who::extra(&account).report("9Router", Kind::Api), &stats, &sub.key, chart.as_ref()));
         }
     }
     out
@@ -240,7 +301,6 @@ fn status_for(e: &RouterError) -> Status {
 /// Sub-proveedor concreto de 9Router (cuenta adicional `nine_router:<id>`).
 fn build_sub(report: &UsageReport, stats: &Value, provider: &str, chart: Option<&Value>) -> UsageReport {
     let mut report = report.clone();
-    let daily = chart.map(parse_daily).unwrap_or_default();
 
     let Some(entry) = stats.get("byProvider").and_then(|b| b.get(provider)).cloned() else {
         return report.fail(
@@ -252,7 +312,10 @@ fn build_sub(report: &UsageReport, stats: &Value, provider: &str, chart: Option<
     report.plan = Some("Vía 9Router".into());
     report.meters = p.meters;
     report.spend = p.spend;
-    report.daily = daily;
+    // La serie `/api/usage/chart` es agregada (todos los proveedores): no se puede
+    // atribuir a un sub-proveedor sin un desglose por proveedor. Antes de exponer
+    // datos de otros, se omite; si la chart trae un campo por proveedor, se usa.
+    report.daily = chart.map(|c| parse_daily_for(c, Some(provider))).unwrap_or_default();
     report.message = p.message;
     report
 }
@@ -352,18 +415,84 @@ fn parse_provider(entry: &Value) -> Parsed {
 }
 
 /// Serie `[{label,tokens,cost,requests}]` de la chart → `Daily` (fecha + tokens).
-/// El `label` de 9Router puede ser fecha u hora; se conserva tal cual como clave.
+/// El `label` de 9Router es una fecha u hora legible («Oct 5», «14:00»); el
+/// frontend espera `YYYY-MM-DD` (le añade `T00:00:00`), así que se normaliza y se
+/// agrupa por día sumando tokens. Lo que no se pueda interpretar se descarta.
 fn parse_daily(chart: &Value) -> Vec<Daily> {
-    chart
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|e| {
-            let date = e.get("label").and_then(Value::as_str)?.to_string();
-            let value = e.get("tokens").and_then(Value::as_f64).unwrap_or(0.0);
-            Some(Daily { date, value })
-        })
-        .collect()
+    parse_daily_for(chart, None)
+}
+
+/// Igual que `parse_daily`, pero para un sub-proveedor: si la chart trae un
+/// desglose por proveedor, se usa el del indicado; si no, se devuelve vacío en
+/// vez de exponer la serie agregada (que incluiría a los demás).
+fn parse_daily_for(chart: &Value, provider: Option<&str>) -> Vec<Daily> {
+    let mut by_day: BTreeMap<String, f64> = BTreeMap::new();
+    for e in chart.as_array().into_iter().flatten() {
+        let Some(label) = e.get("label").and_then(Value::as_str) else { continue };
+        let Some(date) = normalize_day(label) else { continue };
+        let value = match provider {
+            None => e.get("tokens").and_then(Value::as_f64).unwrap_or(0.0),
+            Some(p) => match e.get("provider").and_then(Value::as_str) {
+                Some(name) if name == p => e.get("tokens").and_then(Value::as_f64).unwrap_or(0.0),
+                _ => continue,
+            },
+        };
+        *by_day.entry(date).or_insert(0.0) += value;
+    }
+    by_day.into_iter().map(|(date, value)| Daily { date, value }).collect()
+}
+
+/// Normaliza la etiqueta de la chart a `YYYY-MM-DD`. Acepta ISO (`2026-10-05`),
+/// `YYYY-MM-DD HH:MM`, fechas ya completas con hora, y etiquetas cortas de mes y
+/// día (`Oct 5`, `5 Oct`) u horas (`14:00`) sin contexto de año.
+fn normalize_day(label: &str) -> Option<String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+    // Ya viene como fecha ISO completa (posible `T` u hora).
+    if let Some(date) = label.get(..10).filter(|s| is_iso_date(s)) {
+        return Some((*date).to_string());
+    }
+    // `YYYY-MM-DD HH:MM` sin T.
+    if label.len() >= 10 && is_iso_date(&label[..10]) {
+        return Some(label[..10].to_string());
+    }
+    // Etiqueta corta de mes y día («Oct 5», «5 Oct»), con el año en curso. El
+    // nombre del mes se resuelve a mano para no depender del locale de chrono.
+    let now = chrono::Utc::now();
+    let parts: Vec<&str> = label.split_whitespace().collect();
+    if let [a, b] = parts[..] {
+        let (month_name, day_str) = if month_number(a).is_some() { (a, b) } else { (b, a) };
+        if let (Some(month), Ok(day)) = (month_number(month_name), day_str.parse::<u32>()) {
+            return chrono::NaiveDate::from_ymd_opt(now.year(), month, day)
+                .map(|d| d.format("%Y-%m-%d").to_string());
+        }
+    }
+    // Solo la hora («14:00»): se atribuye al día de hoy.
+    if chrono::NaiveTime::parse_from_str(label, "%H:%M").is_ok() {
+        return Some(now.date_naive().format("%Y-%m-%d").to_string());
+    }
+    None
+}
+
+/// ¿Es `s` exactamente `YYYY-MM-DD`?
+fn is_iso_date(s: &str) -> bool {
+    s.len() == 10
+        && s.as_bytes()[4] == b'-'
+        && s.as_bytes()[7] == b'-'
+        && s.chars().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+}
+
+/// Número de mes (1–12) a partir de un nombre en inglés, corto o completo
+/// (`oct`/`october`). Independiente del locale.
+fn month_number(name: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    const FULL: [&str; 12] = [
+        "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+    ];
+    let n = name.trim().to_ascii_lowercase();
+    MONTHS.iter().position(|m| *m == n).or_else(|| FULL.iter().position(|m| *m == n)).map(|i| i as u32 + 1)
 }
 
 fn period_label(period: &str) -> String {
@@ -404,15 +533,52 @@ mod tests {
     }
 
     #[test]
-    fn chart_becomes_daily_series() {
+    fn chart_becomes_daily_series_with_normalized_dates() {
+        // La chart trae etiquetas legibles («Oct 5»), horas y fechas ISO. El
+        // frontend espera YYYY-MM-DD y añade T00:00:00: hay que normalizar y
+        // agrupar por día (regresión del punto 5 del feedback).
+        let year = chrono::Utc::now().year();
         let chart = json!([
-            {"label": "Oct 5", "tokens": 120, "cost": 0.1, "requests": 2},
-            {"label": "Oct 6", "tokens": 0, "cost": 0, "requests": 0}
+            {"label": "Oct 5", "tokens": 120},
+            {"label": "14:00", "tokens": 30},
+            {"label": format!("{year}-10-05"), "tokens": 5},
+            {"label": "vaya", "tokens": 999}
         ]);
         let d = parse_daily(&chart);
-        assert_eq!(d.len(), 2);
-        assert_eq!(d[0], Daily { date: "Oct 5".into(), value: 120.0 });
-        assert_eq!(d[1].value, 0.0);
+        let oct5 = format!("{year}-10-05");
+        // Tres muestras caen en dos días (Oct 5 y hoy); «vaya» se descarta.
+        assert!(d.iter().all(|x| x.date.len() == 10 && x.date.as_bytes()[4] == b'-'));
+        let total: f64 = d.iter().map(|x| x.value).sum();
+        assert!((total - 155.0).abs() < 1e-6, "total inesperado: {total}");
+        // Las dos etiquetas del 5 de octubre se agrupan en una sola entrada.
+        let oct5_total: f64 = d.iter().filter(|x| x.date == oct5).map(|x| x.value).sum();
+        assert!((oct5_total - 125.0).abs() < 1e-6, "oct5 inesperado: {oct5_total}");
+    }
+
+    #[test]
+    fn sub_series_is_empty_without_per_provider_breakdown() {
+        // La chart es agregada: un sub-proveedor no debe mostrar tokens de otros.
+        let chart = json!([{"label": "Oct 5", "tokens": 120}]);
+        assert!(parse_daily_for(&chart, Some("claude")).is_empty());
+    }
+
+    #[test]
+    fn sub_series_uses_per_provider_field_when_present() {
+        let chart = json!([
+            {"label": "Oct 5", "tokens": 120, "provider": "claude"},
+            {"label": "Oct 5", "tokens": 80, "provider": "kiro"}
+        ]);
+        let d = parse_daily_for(&chart, Some("claude"));
+        assert_eq!(d.len(), 1);
+        assert!((d[0].value - 120.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stats_error_maps_to_status() {
+        // Regresión del punto 3: sin credenciales y con el servidor exigiendo
+        // sesión, el orbe pide login (no «falta configurar»); un fallo de red es Error.
+        assert_eq!(StatsError::NeedsLogin.status(), Status::NeedsLogin);
+        assert_eq!(StatsError::Other(RouterError::Other("x".into())).status(), Status::Error);
     }
 
     #[test]
@@ -441,6 +607,10 @@ mod tests {
         );
     }
 
+    fn account_ids(subs: &[SubProvider]) -> Vec<String> {
+        subs.iter().map(|s| s.account_id.clone()).collect()
+    }
+
     #[test]
     fn discovered_providers_are_valid_account_ids() {
         let stats = json!({"byProvider": {
@@ -450,8 +620,41 @@ mod tests {
             "bad id!": {"cost": 9.0},
             "": {"cost": 9.0}
         }});
-        // Solo los que gastan, normalizados a minúsculas y ordenados por coste.
-        assert_eq!(sub_providers_from(&stats, 0.0), vec!["claude".to_string(), "kiro".to_string()]);
+        // Solo los que gastan, con id de cuenta saneado (minúsculas, `-`) y
+        // ordenados por coste. `bad id!` → `bad-id-`; la clave vacía se omite.
+        let subs = sub_providers_from(&stats, 0.0);
+        assert_eq!(
+            account_ids(&subs),
+            vec!["nine_router:bad-id-".to_string(), "nine_router:claude".to_string(), "nine_router:kiro".to_string()]
+        );
+    }
+
+    #[test]
+    fn discovered_provider_keeps_original_key_for_lookup() {
+        // Regresión del punto 6: la clave original (`Kiro`) debe conservarse para
+        // buscar en `byProvider` (distingue mayúsculas); el id va en minúsculas.
+        let stats = json!({"byProvider": {
+            "Kiro": {"cost": 0.5, "requests": 3},
+            "nodO Personal": {"cost": 1.0}
+        }});
+        let subs = sub_providers_from(&stats, 0.0);
+        let kiro = subs.iter().find(|s| s.account_id == "nine_router:kiro").expect("kiro descubierto");
+        assert_eq!(kiro.key, "Kiro");
+        assert_eq!(kiro.label, "Kiro");
+        // `build_sub` con la clave original encuentra el desglose (no cae en Warning).
+        let base = UsageReport::new("nine_router:kiro", "9Router · Kiro", Kind::Api);
+        let r = build_sub(&base, &stats, &kiro.key, None);
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(r.spend.as_ref().map(|s| s.amount), Some(0.5));
+    }
+
+    #[test]
+    fn discovered_provider_sanitizes_account_id_but_keeps_key() {
+        let stats = json!({"byProvider": {"nodO Personal": {"cost": 1.0}}});
+        let subs = sub_providers_from(&stats, 0.0);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].account_id, "nine_router:nodo-personal");
+        assert_eq!(subs[0].key, "nodO Personal");
     }
 
     #[test]
@@ -467,7 +670,10 @@ mod tests {
             "barato": {"cost": 0.5},
             "gratis": {"cost": 0.0}
         }});
-        assert_eq!(sub_providers_from(&stats, 1.0), vec!["caro".to_string()]);
-        assert_eq!(sub_providers_from(&stats, 0.0), vec!["caro".to_string(), "barato".to_string()]);
+        assert_eq!(account_ids(&sub_providers_from(&stats, 1.0)), vec!["nine_router:caro".to_string()]);
+        assert_eq!(
+            account_ids(&sub_providers_from(&stats, 0.0)),
+            vec!["nine_router:caro".to_string(), "nine_router:barato".to_string()]
+        );
     }
 }

@@ -134,4 +134,13 @@ mod tests {
         assert!(!is_known("otra_cosa@openrouter:a1b2c3"));
         assert!(!is_known("openrouter_api_key@../../x"));
     }
+
+    #[test]
+    fn nine_router_forgets_password_and_session_together() {
+        // Regresión del punto 2: desconectar 9Router debe cubrir ambos secretos;
+        // con solo la contraseña borrada, la cookie seguiría dando acceso 24 h.
+        let keys = for_provider("nine_router");
+        assert!(keys.contains(&NINE_ROUTER_PASSWORD));
+        assert!(keys.contains(&NINE_ROUTER_SESSION));
+    }
 }
