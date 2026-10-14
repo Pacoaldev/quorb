@@ -10,4 +10,11 @@ describe('9Router disconnect', () => {
     expect(settingsSource).toContain('api.nineRouterLogout()');
     expect(settingsSource).not.toContain("api.setSecret('nine_router_password'");
   });
+
+  // Regresión del punto 4: «Guardar y probar» debe usar la Base URL del borrador,
+  // no la persistida (antes el backend leía la guardada y probaba contra la vieja).
+  it('prueba el login contra la Base URL del borrador', () => {
+    expect(settingsSource).toContain('api.nineRouterLogin(value, baseUrl)');
+    expect(settingsSource).toContain('baseUrl={cfg.nineRouter.baseUrl}');
+  });
 });

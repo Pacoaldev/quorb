@@ -184,16 +184,20 @@ async fn nan_probe(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 /// Guarda la contraseña del dashboard de 9Router y prueba el login; devuelve las
-/// stats en crudo (Ajustes › 9Router › Probar).
+/// stats en crudo (Ajustes › 9Router › Probar). `base_url` es la del borrador de
+/// Ajustes si el usuario la cambió sin guardar; si no, la persistida.
 #[tauri::command]
-async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password: String) -> Result<String, String> {
+async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password: String, base_url: Option<String>) -> Result<String, String> {
     let cfg = state.config.lock().unwrap().clone();
-    let base = cfg.nine_router.base_url.clone();
+    let base = base_url
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| cfg.nine_router.base_url.clone());
     let cookie = providers::nine_router::login(&state.http, &base, &password).await?;
     secrets::set(secrets::NINE_ROUTER_PASSWORD, &password)?;
     secrets::set(secrets::NINE_ROUTER_SESSION, &cookie)?;
     let _ = app.emit("config-changed", ());
-    providers::nine_router::probe(&state.http, &cfg.nine_router).await
+    providers::nine_router::probe(&state.http, &cfg.nine_router, Some(&base)).await
 }
 
 /// Desconecta 9Router: borra la contraseña **y** la cookie de sesión guardadas.

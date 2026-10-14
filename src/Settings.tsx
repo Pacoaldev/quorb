@@ -12,6 +12,7 @@ import { ACCENT_PRESETS, DEFAULT_ACCENT, derivePalette, normalizeHex } from './l
 import { isDirty, isSettingsDirty, liveSaveConfig, reconcileSaved } from './lib/settings-dirty';
 import { createAutostartController } from './lib/autostart-controller';
 import { configPersistedAfterSave, runMixedSave, mixedSaveMessage, reloadSecretsAfterSave } from './lib/settings-save';
+import { hiddenNineRouterIds, nineRouterSubName, revealIds, revealNineRouter } from './lib/visibility';
 import { openAccountLogin } from './lib/account-login';
 import { createPresencePoller, effectivePersisted, isConnectionDirty } from './lib/account-health';
 import { createCodexInstallController, type CodexInstallController } from './lib/codex-install';
@@ -332,7 +333,7 @@ function NanProbe() {
 }
 
 /** Contraseña del dashboard de 9Router: se guarda y se prueba el login a la vez. */
-function NineRouterConnect({ connected, onChange }: { connected: boolean; onChange: () => void }) {
+function NineRouterConnect({ connected, baseUrl, onChange }: { connected: boolean; baseUrl: string; onChange: () => void }) {
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -346,7 +347,9 @@ function NineRouterConnect({ connected, onChange }: { connected: boolean; onChan
         await api.nineRouterLogout();
         setMsg('9Router desconectado');
       } else {
-        setOut(await api.nineRouterLogin(value));
+        // Prueba contra la URL del borrador: si el usuario cambió «Base URL» sin
+        // guardar, el login debe ir a esa, no a la persistida (regresión punto 4).
+        setOut(await api.nineRouterLogin(value, baseUrl));
         setMsg('Conectado');
       }
       setPassword('');
@@ -1631,9 +1634,13 @@ export function Settings() {
             </button>
           ))}
         </div>
-        <button type="button" className="eg-btn eg-btn--ghost eg-btn--sm" onClick={addAccount}>
-          + Añadir cuenta
-        </button>
+        {tab === 'nine_router' ? (
+          <small className="eg-field__hint">Los subproveedores de 9Router se descubren solos desde su historial de uso; no se añaden a mano.</small>
+        ) : (
+          <button type="button" className="eg-btn eg-btn--ghost eg-btn--sm" onClick={addAccount}>
+            + Añadir cuenta
+          </button>
+        )}
       </div>
       {selAccount && (
         <AccountEditor
@@ -1865,7 +1872,16 @@ export function Settings() {
 
       {tab === 'nine_router' && (
         <Section kicker="Pasarela local · uso agregado" title="9Router">
-          <Toggle label="Mostrar en el widget" checked={cfg.nineRouter.enabled} onChange={(v) => set('nineRouter', { enabled: v })} />
+              <Toggle
+                label="Mostrar en el widget"
+                checked={cfg.nineRouter.enabled}
+                onChange={(v) => {
+                  // Al reactivar, recupera los orbes de 9Router que se ocultaron
+                  // desde el widget (si no, seguirían en hiddenProviders y no reaparecerían).
+                  if (v) set('hiddenProviders', revealNineRouter(cfg.hiddenProviders));
+                  set('nineRouter', { enabled: v });
+                }}
+              />
           <p className="q-note">
             Quorb lee el uso y el gasto que <b>9Router</b> ya registra en tu equipo: peticiones, tokens y coste por proveedor del periodo. Además del
             orbe agregado, cada proveedor que haya visto (Claude, Kiro, GLM…) aparece como su propia cuenta.
@@ -1873,7 +1889,7 @@ export function Settings() {
           <ol className="q-steps" aria-label="Cómo conectar 9Router">
             <li data-done={!!secrets.nine_router_password || undefined}>
               <b>Conecta tu dashboard local</b>
-              <NineRouterConnect connected={!!secrets.nine_router_password} onChange={loadSecrets} />
+              <NineRouterConnect connected={!!secrets.nine_router_password} baseUrl={cfg.nineRouter.baseUrl} onChange={loadSecrets} />
             </li>
             <li data-done>
               <b>Periodo y desglose</b>
@@ -1919,6 +1935,24 @@ export function Settings() {
               <input type="text" spellCheck={false} value={cfg.nineRouter.baseUrl} onChange={(e) => set('nineRouter', { baseUrl: e.target.value })} />
             </Field>
           </details>
+          {(() => {
+            // Suborbes de 9Router ocultados desde el widget: se pueden recuperar aquí.
+            const hidden = hiddenNineRouterIds(cfg.hiddenProviders);
+            if (hidden.length === 0) return null;
+            return (
+              <div className="eg-field">
+                <span className="eg-field__label">Suborbes ocultos de 9Router</span>
+                <div className="q-chips">
+                  {hidden.map((id) => (
+                    <button key={id} type="button" className="eg-chip" onClick={() => set('hiddenProviders', revealIds(cfg.hiddenProviders, [id]))}>
+                      {nineRouterSubName(id)} · mostrar
+                    </button>
+                  ))}
+                </div>
+                <small className="eg-field__hint">Los ocultaste desde su panel en la tira. Pulsa para volver a mostrarlos.</small>
+              </div>
+            );
+          })()}
         </Section>
       )}
 
