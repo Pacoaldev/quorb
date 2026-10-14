@@ -126,6 +126,15 @@ fn save_config(app: AppHandle, state: State<'_, AppState>, config: AppConfig) ->
     for gone in old.accounts.iter().filter(|a| !config.accounts.iter().any(|b| b.id == a.id)) {
         secrets::forget_account(gone);
     }
+    // P1 (4º feedback): los secretos de 9Router (contraseña/cookie) pertenecen al
+    // servidor con el que se conectaron, no van asociados a una URL. Si el guardado
+    // cambia la Base URL, los secretos guardados son del destino antiguo: dejarlos
+    // haría que el siguiente fetch enviara credenciales de A a B (o al revés),
+    // rompiendo la conexión y exponiendo credenciales a un destino distinto. Se
+    // invalidan para forzar una reconexión contra el destino nuevo.
+    if nine_router_destination_changed(old.nine_router.base_url.trim(), config.nine_router.base_url.trim()) {
+        forget_nine_router_secrets();
+    }
     let old_shortcuts = old.shortcuts;
     if old_shortcuts != config.shortcuts {
         apply_shortcuts(&app, &config.shortcuts);
@@ -137,6 +146,20 @@ fn save_config(app: AppHandle, state: State<'_, AppState>, config: AppConfig) ->
     }
     let _ = app.emit("config-changed", &config);
     Ok(config)
+}
+
+/// ¿El guardado cambia el destino de 9Router? Compara ignorando la barra final y
+/// los espacios. Cuando cambia, las credenciales guardadas (del destino anterior)
+/// dejan de ser válidas para el nuevo y hay que invalidarlas.
+fn nine_router_destination_changed(old_base: &str, new_base: &str) -> bool {
+    old_base.trim().trim_end_matches('/') != new_base.trim().trim_end_matches('/')
+}
+
+/// Borra la contraseña **y** la cookie de 9Router. Con solo la contraseña borrada,
+/// la cookie seguiría dando acceso hasta caducar (y pertenece al destino viejo).
+fn forget_nine_router_secrets() {
+    let _ = secrets::set(secrets::NINE_ROUTER_PASSWORD, "");
+    let _ = secrets::set(secrets::NINE_ROUTER_SESSION, "");
 }
 
 /// Merge atómico de los campos del widget sobre la config actual: nunca toca
@@ -209,6 +232,11 @@ async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password:
         secrets::set(secrets::NINE_ROUTER_PASSWORD, &password)?;
         secrets::set(secrets::NINE_ROUTER_SESSION, &cookie)?;
         let _ = app.emit("config-changed", ());
+        // P2 (4º feedback): la conexión no cambia la config, así que `config-changed`
+        // no obliga a refrescar los datos del widget (que se refrescan por
+        // `needsRefresh`, que mira la config, no las credenciales). Se pide el
+        // refresco explícito para que el orbe refleje la sesión recién establecida.
+        let _ = app.emit("refresh-now", ());
         providers::nine_router::probe(&state.http, &cfg.nine_router, Some(&base)).await
     } else {
         // Destino del borrador ≠ persistido: prueba aislada, sin persistir nada.
@@ -220,9 +248,11 @@ async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password:
 /// Con solo la contraseña borrada, la cookie seguiría dando acceso hasta caducar.
 #[tauri::command]
 fn nine_router_logout(app: AppHandle) -> Result<(), String> {
-    secrets::set(secrets::NINE_ROUTER_PASSWORD, "")?;
-    secrets::set(secrets::NINE_ROUTER_SESSION, "")?;
+    forget_nine_router_secrets();
     let _ = app.emit("config-changed", ());
+    // P2 (4º feedback): desconectar también debe refrescar el widget al instante
+    // (misma razón que en el login: la config no cambia, solo la sesión).
+    let _ = app.emit("refresh-now", ());
     Ok(())
 }
 
@@ -687,6 +717,23 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::config::Account;
+
+    /// P1 (4º feedback): guardar una Base URL de 9Router distinta invalida los
+    /// secretos del destino anterior. Sin esto, el siguiente fetch enviaría la
+    /// cookie de A a B (o al revés), rompiendo la conexión anterior y exponiendo
+    /// credenciales a otro destino. Escenario: conectado a A → cambiar a B →
+    /// «Guardar» → los secretos de A no deben sobrevivir al guardado.
+    #[test]
+    fn saving_a_new_nine_router_base_url_invalidates_old_secrets() {
+        // Mismo destino (con o sin barra final/espacios): los secretos siguen valiendo.
+        assert!(!nine_router_destination_changed("http://localhost:20128", "http://localhost:20128"));
+        assert!(!nine_router_destination_changed("http://localhost:20128/", "http://localhost:20128"));
+        assert!(!nine_router_destination_changed("  http://localhost:20128  ", "http://localhost:20128/"));
+        // Otro destino: hay que invalidar (se borran contraseña y cookie).
+        assert!(nine_router_destination_changed("http://localhost:20128", "http://localhost:3000"));
+        assert!(nine_router_destination_changed("http://localhost:20128", "http://otro-host:20128"));
+        assert!(nine_router_destination_changed("http://localhost:20128", "https://localhost:20128"));
+    }
 
     /// Carpeta temporal propia de cada prueba: sin dependencias nuevas y sin
     /// tocar ninguna ruta real del usuario.
