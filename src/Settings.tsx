@@ -343,8 +343,8 @@ function NineRouterConnect({ connected, onChange }: { connected: boolean; onChan
     setMsg(null);
     try {
       if (!value.trim()) {
-        await api.setSecret('nine_router_password', '');
-        setMsg('Contraseña eliminada');
+        await api.nineRouterLogout();
+        setMsg('9Router desconectado');
       } else {
         setOut(await api.nineRouterLogin(value));
         setMsg('Conectado');

@@ -120,6 +120,7 @@ pub async fn fetch_one(cfg: &AppConfig, id: &str, http: &reqwest::Client) -> Opt
         "copilot" => copilot::fetch(&cfg.copilot, Who::main("copilot"), http).await,
         "nan" => nan::fetch(&cfg.nan, Who::main("nan"), http).await,
         "openrouter" => openrouter::fetch(&cfg.openrouter, Who::main("openrouter"), http).await,
+        "nine_router" => nine_router::fetch(&cfg.nine_router, Who::main("nine_router"), http).await,
         "anthropic_api" => anthropic_api::fetch(&cfg.anthropic_api, Who::main("anthropic_api"), http).await,
         "openai_api" => openai_api::fetch(&cfg.openai_api, Who::main("openai_api"), http).await,
         _ => return None,
