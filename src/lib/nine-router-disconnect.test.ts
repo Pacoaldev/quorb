@@ -1,4 +1,6 @@
 import settingsSource from '../Settings.tsx?raw';
+import widgetSource from '../Widget.tsx?raw';
+import libSource from '../../src-tauri/src/lib.rs?raw';
 import { describe, expect, it } from 'vitest';
 
 // Contrato de la desconexión de 9Router (regresión del punto 2 del feedback):
@@ -16,5 +18,19 @@ describe('9Router disconnect', () => {
   it('prueba el login contra la Base URL del borrador', () => {
     expect(settingsSource).toContain('api.nineRouterLogin(value, baseUrl)');
     expect(settingsSource).toContain('baseUrl={cfg.nineRouter.baseUrl}');
+  });
+
+  // 4º feedback P1: guardar una Base URL distinta debe invalidar los secretos del
+  // destino anterior (si no, el siguiente fetch envía credenciales de A a B).
+  it('save_config invalida los secretos al cambiar la Base URL de 9Router', () => {
+    expect(libSource).toContain('nine_router_destination_changed');
+    expect(libSource).toContain('forget_nine_router_secrets');
+  });
+
+  // 4º feedback P2: conectar/desconectar no cambia la config, así que se necesita
+  // una señal explícita de refresco (`refresh-now`) para el widget.
+  it('login y logout piden refresco explícito del widget', () => {
+    expect(libSource).toContain('refresh-now');
+    expect(widgetSource).toContain("listen('refresh-now'");
   });
 });
