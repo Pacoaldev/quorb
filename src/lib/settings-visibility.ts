@@ -10,6 +10,19 @@ export const CONFIG_KEY: Readonly<Record<string, MainKey>> = {
   anthropic_api: 'anthropicApi', openai_api: 'openaiApi',
 };
 
+/**
+ * Mapeo id de informe → clave de config para el flujo que compara borrador vs.
+ * guardado (aviso «cambios sin guardar» del paso de conexión). Incluye 9Router,
+ * que no está en `CONFIG_KEY` porque su visibilidad no usa las `accounts` ni la
+ * clave genérica: sin esto, `sectionDirty('nine_router')` nunca detectaba el
+ * borrador (p. ej. la Base URL cambiada sin guardar) y el paso «URL ahora»
+ * consultaba el destino persistido como si no hubiera cambios.
+ */
+export function configKeyFor(id: string): MainKey | 'nineRouter' | undefined {
+  if (id === 'nine_router') return 'nineRouter';
+  return CONFIG_KEY[id];
+}
+
 export const isAccountVisible = (cfg: Pick<AppConfig, 'hiddenProviders'>, id: string, enabled: boolean) =>
   enabled && !cfg.hiddenProviders.includes(id);
 

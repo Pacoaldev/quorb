@@ -6,7 +6,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { getVersion } from '@tauri-apps/api/app';
 import { useAppName } from './lib/app-identity';
 import { api } from './lib/api';
-import { CONFIG_KEY, isAccountVisible, setAccountVisibility } from './lib/settings-visibility';
+import { configKeyFor, isAccountVisible, setAccountVisibility } from './lib/settings-visibility';
 import { ORB_SIZE, type Account, type AccountProvider, type AlertMoment, type AppConfig, type Effect, type MediaSize, type NineRouterPeriod, type ScopedSecretKey, type SecretKey, type SecretStatus, type UsageReport } from './lib/types';
 import { ACCOUNT_SECRETS, CLI_INSTALL, SESSION_DIR, accountReady, accountsOf, defaultSessionDir, newAccount, secretKey } from './lib/accounts';
 import { ACCENT_PRESETS, DEFAULT_ACCENT, derivePalette, normalizeHex } from './lib/palette';
@@ -1439,7 +1439,7 @@ export function Settings() {
   const secretsSig = JSON.stringify(secrets);
   const sectionDirty = (id: string) => {
     const acc = cfg.accounts.find((a) => a.id === id);
-    const k = CONFIG_KEY[acc?.provider ?? id];
+    const k = configKeyFor(acc?.provider ?? id);
     return isConnectionDirty(acc, baseline?.accounts.find((a) => a.id === id), k ? cfg[k] : undefined, k ? baseline?.[k] : undefined);
   };
   const healthFor = (id: string, hidden: boolean): HealthProps => ({ saved: baseline, secretsSig, dirty: sectionDirty(id), hidden, saving, onSave: save });

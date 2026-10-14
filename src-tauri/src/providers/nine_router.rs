@@ -16,7 +16,6 @@ use super::{net_error, Who};
 use crate::config::NineRouterConfig;
 use crate::model::{Daily, Kind, Meter, Spend, Status, UsageReport};
 use crate::secrets;
-use chrono::Datelike;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -33,6 +32,17 @@ impl RouterError {
             RouterError::Expired => "La sesión de 9Router ha caducado. Vuelve a introducir la contraseña en Ajustes.".into(),
             RouterError::Other(m) => m,
         }
+    }
+}
+
+/// ¿El destino del borrador coincide con el persistido? Compara ignorando la
+/// barra final. `None` (sin borrador) se considera el persistido. Cuando NO
+/// coinciden, «Guardar y probar» debe usar una sesión temporal aislada para no
+/// guardar las credenciales de otro servidor (ver `nine_router_login`).
+pub fn same_destination(saved: &str, draft: Option<&str>) -> bool {
+    match draft {
+        None => true,
+        Some(d) => d.trim().trim_end_matches('/') == saved.trim().trim_end_matches('/'),
     }
 }
 
@@ -122,10 +132,30 @@ pub async fn probe(http: &reqwest::Client, cfg: &NineRouterConfig, base_override
                 .await
                 .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
                 .map_err(RouterError::message),
-            None => Err("La sesión caducó y no hay contraseña guardada.".into()),
+            None => Err("La sesión de 9Router caducó y no hay contraseña guardada.".into()),
         },
         Err(e) => Err(e.message()),
     }
+}
+
+/// Prueba el destino indicado con una contraseña dada, **sin persistir nada**:
+/// usa una cookie temporal en memoria. Para «Guardar y probar» contra la URL del
+/// borrador cuando difiere de la persistida: así una prueba contra otro servidor
+/// no deja sus credenciales guardadas (que luego A usaría contra su propio
+/// destino). No lee ni escribe los secretos globales.
+pub async fn probe_with_password(http: &reqwest::Client, cfg: &NineRouterConfig, base: &str, password: &str) -> Result<String, String> {
+    let base = base.trim_end_matches('/');
+    // ¿Está vivo? (endpoint público, con CORS abierto)
+    http.get(format!("{base}/api/health"))
+        .send()
+        .await
+        .map_err(|e| format!("No encuentro 9Router en {base}: {}", net_error(e)))?;
+
+    let cookie = login(http, base, password).await?;
+    get_stats(http, base, &cfg.period, &cookie)
+        .await
+        .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+        .map_err(RouterError::message)
 }
 
 async fn get_stats(http: &reqwest::Client, base: &str, period: &str, cookie: &str) -> Result<Value, RouterError> {
@@ -296,8 +326,11 @@ pub async fn fetch_all(cfg: &NineRouterConfig, http: &reqwest::Client) -> Vec<Us
         .await
         .ok();
 
-    let today = chrono::Utc::now().date_naive();
-    let mut out = vec![build_main(cfg, &main_report, &stats, chart.as_ref(), today)];
+    // Instante de referencia: se inyecta en el parseo de la serie para que cada
+    // bucket se feche según la ventana real del período (24h cruza medianoche,
+    // 60d/all pueden cruzar el año).
+    let now = chrono::Local::now();
+    let mut out = vec![build_main(cfg, &main_report, &stats, chart.as_ref(), now)];
     if cfg.show_sub_providers {
         let cookie = cookie.as_deref().unwrap_or("");
         let node_names = fetch_node_names(http, base, cookie).await;
@@ -309,7 +342,7 @@ pub async fn fetch_all(cfg: &NineRouterConfig, http: &reqwest::Client) -> Vec<Us
                 enabled: true,
                 ..Default::default()
             };
-            out.push(build_sub(&Who::extra(&account).report("9Router", Kind::Api), &stats, &sub.key, chart.as_ref(), today));
+            out.push(build_sub(&Who::extra(&account).report("9Router", Kind::Api), &stats, &sub.key, chart.as_ref(), &cfg.period, now));
         }
     }
     out
@@ -323,7 +356,7 @@ fn status_for(e: &RouterError) -> Status {
 }
 
 /// Sub-proveedor concreto de 9Router (cuenta adicional `nine_router:<id>`).
-fn build_sub(report: &UsageReport, stats: &Value, provider: &str, chart: Option<&Value>, today: chrono::NaiveDate) -> UsageReport {
+fn build_sub(report: &UsageReport, stats: &Value, provider: &str, chart: Option<&Value>, period: &str, now: chrono::DateTime<chrono::Local>) -> UsageReport {
     let mut report = report.clone();
 
     let Some(entry) = stats.get("byProvider").and_then(|b| b.get(provider)).cloned() else {
@@ -339,13 +372,13 @@ fn build_sub(report: &UsageReport, stats: &Value, provider: &str, chart: Option<
     // La serie `/api/usage/chart` es agregada (todos los proveedores): no se puede
     // atribuir a un sub-proveedor sin un desglose por proveedor. Antes de exponer
     // datos de otros, se omite; si la chart trae un campo por proveedor, se usa.
-    report.daily = chart.map(|c| parse_daily_for(c, Some(provider), today)).unwrap_or_default();
+    report.daily = chart.map(|c| parse_daily_for(c, Some(provider), period, now)).unwrap_or_default();
     report.message = p.message;
     report
 }
 
 /// Orbe agregador: totales del periodo + sub-proveedores activos.
-fn build_main(cfg: &NineRouterConfig, report: &UsageReport, stats: &Value, chart: Option<&Value>, today: chrono::NaiveDate) -> UsageReport {
+fn build_main(cfg: &NineRouterConfig, report: &UsageReport, stats: &Value, chart: Option<&Value>, now: chrono::DateTime<chrono::Local>) -> UsageReport {
     let mut report = report.clone();
     let totals = parse_totals(stats);
 
@@ -380,7 +413,7 @@ fn build_main(cfg: &NineRouterConfig, report: &UsageReport, stats: &Value, chart
         period_label: period_label(&cfg.period),
         budget: cfg.monthly_budget_usd,
     });
-    report.daily = chart.map(|c| parse_daily(c, today)).unwrap_or_default();
+    report.daily = chart.map(|c| parse_daily(c, &cfg.period, now)).unwrap_or_default();
     report.message = Some(format!(
         "{} peticiones · {} tokens · {:.2} $",
         totals.requests, totals.tokens, totals.cost
@@ -439,23 +472,31 @@ fn parse_provider(entry: &Value) -> Parsed {
 }
 
 /// Serie `[{label,tokens,cost,requests}]` de la chart → `Daily` (fecha + tokens).
-/// El `label` de 9Router es una fecha u hora legible («Oct 5», «14:00»); el
-/// frontend espera `YYYY-MM-DD` (le añade `T00:00:00`), así que se normaliza y se
-/// agrupa por día sumando tokens. Lo que no se pueda interpretar se descarta.
-/// `today` fija la fecha de referencia para las etiquetas sin año (hora o mes/día);
-/// se inyecta para poder probarlo y para que todas usen el mismo día.
-fn parse_daily(chart: &Value, today: chrono::NaiveDate) -> Vec<Daily> {
-    parse_daily_for(chart, None, today)
+/// 9Router construye la chart **posicionalmente**: el bucket `i` es un instante
+/// concreto (`getChartData` genera `startTime + i·intervalo`), y el `label` es
+/// solo su presentación. Por eso la fecha fiable sale del índice + la ventana del
+/// período + el instante de referencia `now`, no del label: en `24h` las horas
+/// anteriores a la actual son de *ayer* (`18:00` de la víspera) y en `60d`/`all`
+/// los días de mes/día (`Dec 31`) pueden ser del *año anterior*. Sin esto, ambos
+/// acababan en el día/año de `now` y varios buckets colapsaban en una fecha falsa.
+/// Se agrupa por día sumando tokens. `now` se inyecta para que el test sea
+/// determinista y para que todos los buckets compartan la misma referencia.
+fn parse_daily(chart: &Value, period: &str, now: chrono::DateTime<chrono::Local>) -> Vec<Daily> {
+    parse_daily_for(chart, None, period, now)
 }
 
 /// Igual que `parse_daily`, pero para un sub-proveedor: si la chart trae un
 /// desglose por proveedor, se usa el del indicado; si no, se devuelve vacío en
 /// vez de exponer la serie agregada (que incluiría a los demás).
-fn parse_daily_for(chart: &Value, provider: Option<&str>, today: chrono::NaiveDate) -> Vec<Daily> {
+fn parse_daily_for(chart: &Value, provider: Option<&str>, period: &str, now: chrono::DateTime<chrono::Local>) -> Vec<Daily> {
+    let entries: Vec<&Value> = chart.as_array().into_iter().flatten().collect();
     let mut by_day: BTreeMap<String, f64> = BTreeMap::new();
-    for e in chart.as_array().into_iter().flatten() {
-        let Some(label) = e.get("label").and_then(Value::as_str) else { continue };
-        let Some(date) = normalize_day(label, today) else { continue };
+    for (i, e) in entries.iter().enumerate() {
+        // La fecha sale de la posición del bucket (ventana del período + `now`).
+        // El label solo se usa como último recurso si el índice no da fecha.
+        let date = bucket_date(period, i, entries.len(), now)
+            .or_else(|| e.get("label").and_then(Value::as_str).and_then(normalize_iso_day));
+        let Some(date) = date else { continue };
         let value = match provider {
             None => e.get("tokens").and_then(Value::as_f64).unwrap_or(0.0),
             Some(p) => match e.get("provider").and_then(Value::as_str) {
@@ -468,36 +509,43 @@ fn parse_daily_for(chart: &Value, provider: Option<&str>, today: chrono::NaiveDa
     by_day.into_iter().map(|(date, value)| Daily { date, value }).collect()
 }
 
-/// Normaliza la etiqueta de la chart a `YYYY-MM-DD`. Acepta ISO (`2026-10-05`),
-/// `YYYY-MM-DD HH:MM`, fechas ya completas con hora, y etiquetas cortas de mes y
-/// día (`Oct 5`, `5 Oct`) u horas (`14:00`) sin contexto de año. `today` aporta
-/// el año y el día para las etiquetas que no los traen.
-fn normalize_day(label: &str, today: chrono::NaiveDate) -> Option<String> {
+/// Fecha `YYYY-MM-DD` del bucket `i` de `n` de la chart, replicando la
+/// construcción posicional de `getChartData` de 9Router:
+///   · `today` → 24 buckets horarios del día de `now` (todos hoy).
+///   · `24h`   → 24 buckets horarios hacia atrás desde `now` (cruza medianoche).
+///   · `7d`/`30d`/`60d` → `n` días consecutivos que acaban hoy.
+///   · `all`   → `n` días consecutivos que acaban hoy (9Router arranca en la
+///     primera lectura; mantener la misma cadencia día a día es lo correcto).
+/// Devuelve `None` si el período no describe una serie posicional conocida.
+fn bucket_date(period: &str, i: usize, n: usize, now: chrono::DateTime<chrono::Local>) -> Option<String> {
+    use chrono::Duration;
+    match period {
+        // 24 buckets horarios desde la medianoche de hoy.
+        "today" => Some(now.date_naive().format("%Y-%m-%d").to_string()),
+        // 24 buckets horarios hacia atrás: el bucket final es la hora actual.
+        "24h" => {
+            let hours_ago = (n.saturating_sub(1).saturating_sub(i)) as i64;
+            Some((now - Duration::hours(hours_ago)).date_naive().format("%Y-%m-%d").to_string())
+        }
+        // `n` días consecutivos que acaban hoy (el último bucket es hoy).
+        "7d" | "30d" | "60d" | "all" => {
+            let days_ago = (n.saturating_sub(1).saturating_sub(i)) as i64;
+            Some((now.date_naive() - Duration::days(days_ago)).format("%Y-%m-%d").to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Normaliza una fecha **ya completa** (`YYYY-MM-DD`, con `T` u hora) a
+/// `YYYY-MM-DD`. Se usa solo como respaldo cuando el índice no aporta fecha; no
+/// interpreta etiquetas sin año (mes/día u hora), que son ambiguas por sí solas.
+fn normalize_iso_day(label: &str) -> Option<String> {
     let label = label.trim();
-    if label.is_empty() {
-        return None;
-    }
-    // Ya viene como fecha ISO completa (posible `T` u hora).
-    if let Some(date) = label.get(..10).filter(|s| is_iso_date(s)) {
-        return Some((*date).to_string());
-    }
-    // `YYYY-MM-DD HH:MM` sin T.
-    if label.len() >= 10 && is_iso_date(&label[..10]) {
+    if label.get(..10).filter(|s| is_iso_date(s)).is_some() {
         return Some(label[..10].to_string());
     }
-    // Etiqueta corta de mes y día («Oct 5», «5 Oct»), con el año en curso. El
-    // nombre del mes se resuelve a mano para no depender del locale de chrono.
-    let parts: Vec<&str> = label.split_whitespace().collect();
-    if let [a, b] = parts[..] {
-        let (month_name, day_str) = if month_number(a).is_some() { (a, b) } else { (b, a) };
-        if let (Some(month), Ok(day)) = (month_number(month_name), day_str.parse::<u32>()) {
-            return chrono::NaiveDate::from_ymd_opt(today.year(), month, day)
-                .map(|d| d.format("%Y-%m-%d").to_string());
-        }
-    }
-    // Solo la hora («14:00»): se atribuye al día de referencia.
-    if chrono::NaiveTime::parse_from_str(label, "%H:%M").is_ok() {
-        return Some(today.format("%Y-%m-%d").to_string());
+    if label.len() >= 10 && is_iso_date(&label[..10]) {
+        return Some(label[..10].to_string());
     }
     None
 }
@@ -508,17 +556,6 @@ fn is_iso_date(s: &str) -> bool {
         && s.as_bytes()[4] == b'-'
         && s.as_bytes()[7] == b'-'
         && s.chars().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
-}
-
-/// Número de mes (1–12) a partir de un nombre en inglés, corto o completo
-/// (`oct`/`october`). Independiente del locale.
-fn month_number(name: &str) -> Option<u32> {
-    const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-    const FULL: [&str; 12] = [
-        "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
-    ];
-    let n = name.trim().to_ascii_lowercase();
-    MONTHS.iter().position(|m| *m == n).or_else(|| FULL.iter().position(|m| *m == n)).map(|i| i as u32 + 1)
 }
 
 fn period_label(period: &str) -> String {
@@ -536,6 +573,7 @@ fn period_label(period: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use serde_json::json;
 
     #[test]
@@ -560,58 +598,133 @@ mod tests {
 
     #[test]
     fn chart_becomes_daily_series_with_normalized_dates() {
-        // La chart trae etiquetas legibles («Oct 5»), horas y fechas ISO. El
-        // frontend espera YYYY-MM-DD y añade T00:00:00: hay que normalizar y
-        // agrupar por día. Fecha de referencia fija para no depender del reloj.
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        // La fecha de cada bucket sale de su posición en la serie (ventana del
+        // período), no del label: con 4 buckets y `7d`, los índices 0..3 son los
+        // días now-3, now-2, now-1 y now (17, 18, 19 y 20). Todos los tokens
+        // cuentan; el label no decide la fecha.
+        let now = chrono::Local.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap();
         let chart = json!([
-            {"label": "Oct 5", "tokens": 120},
-            {"label": "14:00", "tokens": 30},
-            {"label": "2026-10-05", "tokens": 5},
+            {"label": "Oct 14", "tokens": 120},
+            {"label": "Oct 19", "tokens": 30},
+            {"label": "2026-10-20", "tokens": 5},
             {"label": "vaya", "tokens": 999}
         ]);
-        let d = parse_daily(&chart, today);
-        // Todas las claves son YYYY-MM-DD; «vaya» se descarta.
+        let d = parse_daily(&chart, "7d", now);
+        // Todas las claves son YYYY-MM-DD y cada índice cae en su día.
         assert!(d.iter().all(|x| x.date.len() == 10 && x.date.as_bytes()[4] == b'-'));
         let total: f64 = d.iter().map(|x| x.value).sum();
-        assert!((total - 155.0).abs() < 1e-6, "total inesperado: {total}");
-        // «Oct 5» y la ISO del 5 se agrupan en una sola entrada (con el año de `today`).
-        let oct5_total: f64 = d.iter().filter(|x| x.date == "2026-10-05").map(|x| x.value).sum();
-        assert!((oct5_total - 125.0).abs() < 1e-6, "oct5 inesperado: {oct5_total}");
-        // La hora («14:00») se atribuye al día de referencia.
-        assert!(d.iter().any(|x| x.date == "2026-10-20" && (x.value - 30.0).abs() < 1e-6));
+        assert!((total - 1154.0).abs() < 1e-6, "total inesperado: {total}");
+        assert!(d.iter().any(|x| x.date == "2026-10-20" && (x.value - 999.0).abs() < 1e-6));
+        assert!(d.iter().any(|x| x.date == "2026-10-19" && (x.value - 5.0).abs() < 1e-6));
+        assert!(d.iter().any(|x| x.date == "2026-10-18" && (x.value - 30.0).abs() < 1e-6));
+        assert!(d.iter().any(|x| x.date == "2026-10-17" && (x.value - 120.0).abs() < 1e-6));
     }
 
     #[test]
-    fn normalize_day_uses_injected_date_not_the_clock() {
-        // Regresión del punto 5: la fecha base se inyecta; no se lee el reloj.
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 9).unwrap();
-        assert_eq!(normalize_day("Oct 5", today).as_deref(), Some("2026-10-05"));
-        assert_eq!(normalize_day("5 Oct", today).as_deref(), Some("2026-10-05"));
-        assert_eq!(normalize_day("14:00", today).as_deref(), Some("2026-03-09"));
-        assert_eq!(normalize_day("2025-12-31", today).as_deref(), Some("2025-12-31"));
-        assert_eq!(normalize_day("2025-12-31 23:59", today).as_deref(), Some("2025-12-31"));
-        assert_eq!(normalize_day("vaya", today), None);
+    fn chart_24h_places_each_bucket_on_its_real_day() {
+        // Regresión del punto 2 (P2): con la referencia 2026-01-02 15:00, la serie
+        // de 24 h arranca ayer 16:00. El bucket «18:00» es del 1 de enero, no del
+        // 2; la hora actual (último bucket) sí es de hoy.
+        let now = chrono::Local.with_ymd_and_hms(2026, 1, 2, 15, 0, 0).unwrap();
+        let mut buckets: Vec<serde_json::Value> = Vec::new();
+        for h in 0..24 {
+            // Etiquetas tal cual las emite 9Router (hora local del bucket).
+            let bucket = now - chrono::Duration::hours((23 - h) as i64);
+            buckets.push(json!({"label": bucket.format("%H:%M").to_string(), "tokens": 1}));
+        }
+        let chart = serde_json::Value::Array(buckets);
+        let d = parse_daily(&chart, "24h", now);
+        // El bucket de las 18:00 pertenece al 1 de enero (ayer), no al 2.
+        assert!(d.iter().any(|x| x.date == "2026-01-01"), "falta el 2026-01-01: {d:?}");
+        assert!(d.iter().any(|x| x.date == "2026-01-02"), "falta el 2026-01-02: {d:?}");
+        // Y no colapsa todo en el día de referencia.
+        assert_eq!(d.len(), 2, "la serie 24 h debe repartirse en dos días: {d:?}");
+    }
+
+    #[test]
+    fn chart_60d_keeps_year_boundary_buckets() {
+        // Regresión del punto 2 (P2): con referencia 2026-01-02, la ventana de 60 d
+        // incluye días de finales de 2025. Un bucket «Dec 31» debe ser 2025-12-31,
+        // no 2026-12-31.
+        let now = chrono::Local.with_ymd_and_hms(2026, 1, 2, 9, 0, 0).unwrap();
+        let mut buckets: Vec<serde_json::Value> = Vec::new();
+        for i in 0..60 {
+            let day = now.date_naive() - chrono::Duration::days((59 - i) as i64);
+            buckets.push(json!({"label": day.format("%b %-d").to_string(), "tokens": 1}));
+        }
+        let chart = serde_json::Value::Array(buckets);
+        let d = parse_daily(&chart, "60d", now);
+        assert!(d.iter().any(|x| x.date == "2025-12-31"), "falta el 2025-12-31: {d:?}");
+        assert!(d.iter().any(|x| x.date == "2026-01-02"), "falta el 2026-01-02: {d:?}");
+        // 60 días consecutivos, sin colisión de año.
+        assert_eq!(d.len(), 60, "la serie 60 d debe tener 60 días distintos");
+        assert!(!d.iter().any(|x| x.date == "2026-12-31"), "bucket mal asignado a 2026-12-31");
+    }
+
+    #[test]
+    fn chart_today_buckets_stay_on_reference_day() {
+        // `today` son 24 horas del mismo día: todos los buckets van a `now`.
+        let now = chrono::Local.with_ymd_and_hms(2026, 1, 2, 15, 0, 0).unwrap();
+        let chart = json!([{"label": "00:00", "tokens": 1}, {"label": "23:00", "tokens": 2}]);
+        let d = parse_daily(&chart, "today", now);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].date, "2026-01-02");
+        assert!((d[0].value - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn iso_labels_are_kept_when_index_gives_no_date() {
+        // Con un período desconocido (sin serie posicional) se conserva una fecha
+        // ISO explícita; las etiquetas ambiguas (hora, mes/día) se descartan.
+        let now = chrono::Local.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap();
+        assert_eq!(normalize_iso_day("2025-12-31 23:59").as_deref(), Some("2025-12-31"));
+        assert_eq!(normalize_iso_day("2026-10-05").as_deref(), Some("2026-10-05"));
+        assert_eq!(normalize_iso_day("14:00"), None);
+        assert_eq!(normalize_iso_day("Oct 5"), None);
+        assert_eq!(normalize_iso_day("vaya"), None);
+        // Un período desconocido no inventa fecha; solo acepta las ISO presentes.
+        let chart = json!([{"label": "2026-10-05", "tokens": 7}, {"label": "Oct 5", "tokens": 9}]);
+        let d = parse_daily(&chart, "raro", now);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].date, "2026-10-05");
     }
 
     #[test]
     fn sub_series_is_empty_without_per_provider_breakdown() {
         // La chart es agregada: un sub-proveedor no debe mostrar tokens de otros.
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let now = chrono::Local.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap();
         let chart = json!([{"label": "Oct 5", "tokens": 120}]);
-        assert!(parse_daily_for(&chart, Some("claude"), today).is_empty());
+        assert!(parse_daily_for(&chart, Some("claude"), "7d", now).is_empty());
     }
 
     #[test]
     fn sub_series_uses_per_provider_field_when_present() {
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let now = chrono::Local.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap();
         let chart = json!([
-            {"label": "Oct 5", "tokens": 120, "provider": "claude"},
-            {"label": "Oct 5", "tokens": 80, "provider": "kiro"}
+            {"label": "Oct 20", "tokens": 120, "provider": "claude"},
+            {"label": "Oct 20", "tokens": 80, "provider": "kiro"}
         ]);
-        let d = parse_daily_for(&chart, Some("claude"), today);
+        let d = parse_daily_for(&chart, Some("claude"), "7d", now);
         assert_eq!(d.len(), 1);
         assert!((d[0].value - 120.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn same_destination_matches_saved_url_only() {
+        // Regresión del punto 1 (P1): «Guardar y probar» solo persiste credenciales
+        // cuando el destino del borrador coincide con el persistido. Con A guardada
+        // y B en el borrador la prueba es aislada y no deja las credenciales de B.
+        let saved = "http://localhost:20128";
+        // Sin borrador o igual (con/sin barra final) → mismo destino: se puede guardar.
+        assert!(same_destination(saved, None));
+        assert!(same_destination(saved, Some(saved)));
+        assert!(same_destination(saved, Some("http://localhost:20128/")));
+        assert!(same_destination("http://localhost:20128/", Some(saved)));
+        assert!(same_destination(saved, Some("  http://localhost:20128  ")));
+        // Otro servidor (B) → destino distinto: prueba aislada, sin persistir.
+        assert!(!same_destination(saved, Some("http://localhost:3000")));
+        assert!(!same_destination(saved, Some("http://otro-host:20128")));
+        assert!(!same_destination("http://localhost:20128", Some("https://localhost:20128")));
     }
 
     #[test]
@@ -633,7 +746,7 @@ mod tests {
         let cfg = NineRouterConfig { monthly_budget_usd: Some(100.0), ..Default::default() };
         let stats = json!({"totalRequests": 10, "totalPromptTokens": 400, "totalCompletionTokens": 100, "totalCost": 50.0,
             "byProvider": {"claude": {}, "kiro": {}}});
-        let r = build_main(&cfg, &UsageReport::new("nine_router", "9Router", Kind::Api), &stats, None, chrono::Utc::now().date_naive());
+        let r = build_main(&cfg, &UsageReport::new("nine_router", "9Router", Kind::Api), &stats, None, chrono::Local::now());
         assert_eq!(r.meters[0].label, "Gasto (periodo)");
         assert_eq!(r.meters[0].percent, Some(50.0));
         assert_eq!(r.plan.as_deref(), Some("2 proveedores"));
@@ -684,7 +797,7 @@ mod tests {
         assert_eq!(kiro.label, "Kiro");
         // `build_sub` con la clave original encuentra el desglose (no cae en Warning).
         let base = UsageReport::new("nine_router:kiro", "9Router · Kiro", Kind::Api);
-        let r = build_sub(&base, &stats, &kiro.key, None, chrono::Utc::now().date_naive());
+        let r = build_sub(&base, &stats, &kiro.key, None, "7d", chrono::Local::now());
         assert_eq!(r.status, Status::Ok);
         assert_eq!(r.spend.as_ref().map(|s| s.amount), Some(0.5));
     }
@@ -713,7 +826,7 @@ mod tests {
         // El id de cuenta se sanea (minúsculas y guiones), pero sigue buscando por el id real.
         assert_eq!(subs[0].account_id, format!("nine_router:{}", "openai-compatible-responses-1855f0b7-4442-4046-8368-4d11dda27b96"));
         let base = UsageReport::new(&subs[0].account_id, "9Router · QWEN", Kind::Api);
-        let r = build_sub(&base, &stats, &subs[0].key, None, chrono::Utc::now().date_naive());
+        let r = build_sub(&base, &stats, &subs[0].key, None, "7d", chrono::Local::now());
         assert_eq!(r.status, Status::Ok);
         assert_eq!(r.spend.as_ref().map(|s| s.amount), Some(6.72));
     }

@@ -225,18 +225,34 @@ async fn nan_probe(state: State<'_, AppState>) -> Result<String, String> {
 /// Guarda la contraseña del dashboard de 9Router y prueba el login; devuelve las
 /// stats en crudo (Ajustes › 9Router › Probar). `base_url` es la del borrador de
 /// Ajustes si el usuario la cambió sin guardar; si no, la persistida.
+///
+/// Las credenciales (contraseña y cookie) son del servidor, no van asociadas a
+/// una URL en el almacén: por eso, si el borrador apunta a **otro** destino que
+/// el persistido, la prueba se hace con una **sesión temporal aislada** y no se
+/// guarda nada. Guardar la contraseña/cookie de B en los secretos globales sin
+/// actualizar la URL persistida de A (el borrador se puede descartar) dejaría a A
+/// autenticándose con credenciales de B: rompía la conexión anterior y enviaba
+/// las credenciales a un destino distinto. Solo se persiste cuando el destino
+/// probado coincide con el persistido.
 #[tauri::command]
 async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password: String, base_url: Option<String>) -> Result<String, String> {
     let cfg = state.config.lock().unwrap().clone();
-    let base = base_url
+    let saved_base = cfg.nine_router.base_url.trim();
+    let draft_base = base_url
         .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| cfg.nine_router.base_url.clone());
-    let cookie = providers::nine_router::login(&state.http, &base, &password).await?;
-    secrets::set(secrets::NINE_ROUTER_PASSWORD, &password)?;
-    secrets::set(secrets::NINE_ROUTER_SESSION, &cookie)?;
-    let _ = app.emit("config-changed", ());
-    providers::nine_router::probe(&state.http, &cfg.nine_router, Some(&base)).await
+        .filter(|u| !u.is_empty());
+    let base = draft_base.clone().unwrap_or_else(|| saved_base.to_string());
+    if providers::nine_router::same_destination(saved_base, draft_base.as_deref()) {
+        // Destino idéntico al persistido: se guarda la contraseña y la cookie.
+        let cookie = providers::nine_router::login(&state.http, &base, &password).await?;
+        secrets::set(secrets::NINE_ROUTER_PASSWORD, &password)?;
+        secrets::set(secrets::NINE_ROUTER_SESSION, &cookie)?;
+        let _ = app.emit("config-changed", ());
+        providers::nine_router::probe(&state.http, &cfg.nine_router, Some(&base)).await
+    } else {
+        // Destino del borrador ≠ persistido: prueba aislada, sin persistir nada.
+        providers::nine_router::probe_with_password(&state.http, &cfg.nine_router, &base, &password).await
+    }
 }
 
 /// Desconecta 9Router: borra la contraseña **y** la cookie de sesión guardadas.
