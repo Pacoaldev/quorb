@@ -178,21 +178,24 @@ async fn read_stats(
 
 /// Sub-proveedor descubierto en `byProvider`.
 pub(crate) struct SubProvider {
-    /// Clave tal como la devuelve 9Router (`Kiro`, `claude`). Se usa para volver a
-    /// buscar en `byProvider`, que distingue mayúsculas; **no** se normaliza.
+    /// Clave tal como la devuelve 9Router en `byProvider`: `Kiro`, `claude` o el id
+    /// técnico de un nodo personalizado (`openai-compatible-responses-<uuid>`). Se
+    /// usa para volver a buscar en `byProvider`, que distingue mayúsculas.
     pub key: String,
     /// id de cuenta (`nine_router:<normalizado>`): minúsculas, dígitos y guiones,
     /// para casar con `is_account_id` y ser estable como sufijo.
     pub account_id: String,
-    /// Nombre visible («Kiro»).
+    /// Nombre visible: el de un nodo personalizado («Zhipu», «QWEN - Alibaba») o,
+    /// si no consta, la propia clave.
     pub label: String,
 }
 
 /// Sub-proveedores con gasto por encima del umbral, de mayor a menor coste.
 /// Se omiten los que no llegan al mínimo (por defecto 0 $, o sea gasto > 0): la
 /// tira se llenaría de ceros. Se conserva la clave original para poder buscar en
-/// `byProvider` (que distingue mayúsculas: `Kiro` ≠ `kiro`).
-fn sub_providers_from(stats: &Value, min_spend: f64) -> Vec<SubProvider> {
+/// `byProvider` (que distingue mayúsculas: `Kiro` ≠ `kiro`). `node_names` traduce
+/// el id técnico de un nodo personalizado a su nombre visible.
+fn sub_providers_from(stats: &Value, min_spend: f64, node_names: &BTreeMap<String, String>) -> Vec<SubProvider> {
     let threshold = if min_spend.is_finite() { min_spend.max(0.0) } else { 0.0 };
     let mut entries: Vec<(String, f64)> = stats
         .get("byProvider")
@@ -209,7 +212,7 @@ fn sub_providers_from(stats: &Value, min_spend: f64) -> Vec<SubProvider> {
         .into_iter()
         .map(|(key, _)| {
             let account_id = format!("nine_router:{}", normalize_sub_id(&key));
-            let label = if key.is_empty() { account_id.clone() } else { key.clone() };
+            let label = node_names.get(&key).cloned().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| key.clone());
             SubProvider { key, account_id, label }
         })
         .collect()
@@ -223,6 +226,23 @@ fn normalize_sub_id(key: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' { c } else { '-' })
         .collect()
+}
+
+/// Nombres de los nodos personalizados de 9Router: id técnico → nombre visible
+/// (`openai-compatible-responses-<uuid>` → «QWEN - Alibaba»). `byProvider` los
+/// etiqueta con el id técnico; este endpoint da el nombre con el que el usuario
+/// los creó. Si falla, se devuelve un mapa vacío y se muestra la clave tal cual.
+async fn fetch_node_names(http: &reqwest::Client, base: &str, cookie: &str) -> BTreeMap<String, String> {
+    let Ok(v) = get_json(http, base, "/api/provider-nodes", cookie).await else { return BTreeMap::new() };
+    let mut map = BTreeMap::new();
+    for node in v.get("nodes").and_then(Value::as_array).into_iter().flatten() {
+        let (Some(id), Some(name)) = (node.get("id").and_then(Value::as_str), node.get("name").and_then(Value::as_str)) else { continue };
+        let name = name.trim();
+        if !id.trim().is_empty() && !name.is_empty() {
+            map.insert(id.trim().to_string(), name.to_string());
+        }
+    }
+    map
 }
 
 /// Informe del proveedor agregador (o de uno de sus sub-proveedores si `who` es extra).
@@ -277,7 +297,9 @@ pub async fn fetch_all(cfg: &NineRouterConfig, http: &reqwest::Client) -> Vec<Us
 
     let mut out = vec![build_main(cfg, &main_report, &stats, chart.as_ref())];
     if cfg.show_sub_providers {
-        for sub in sub_providers_from(&stats, cfg.min_spend_usd) {
+        let cookie = cookie.as_deref().unwrap_or("");
+        let node_names = fetch_node_names(http, base, cookie).await;
+        for sub in sub_providers_from(&stats, cfg.min_spend_usd, &node_names) {
             let account = crate::config::Account {
                 id: sub.account_id.clone(),
                 provider: "nine_router".into(),
@@ -622,7 +644,7 @@ mod tests {
         }});
         // Solo los que gastan, con id de cuenta saneado (minúsculas, `-`) y
         // ordenados por coste. `bad id!` → `bad-id-`; la clave vacía se omite.
-        let subs = sub_providers_from(&stats, 0.0);
+        let subs = sub_providers_from(&stats, 0.0, &BTreeMap::new());
         assert_eq!(
             account_ids(&subs),
             vec!["nine_router:bad-id-".to_string(), "nine_router:claude".to_string(), "nine_router:kiro".to_string()]
@@ -637,7 +659,7 @@ mod tests {
             "Kiro": {"cost": 0.5, "requests": 3},
             "nodO Personal": {"cost": 1.0}
         }});
-        let subs = sub_providers_from(&stats, 0.0);
+        let subs = sub_providers_from(&stats, 0.0, &BTreeMap::new());
         let kiro = subs.iter().find(|s| s.account_id == "nine_router:kiro").expect("kiro descubierto");
         assert_eq!(kiro.key, "Kiro");
         assert_eq!(kiro.label, "Kiro");
@@ -651,16 +673,44 @@ mod tests {
     #[test]
     fn discovered_provider_sanitizes_account_id_but_keeps_key() {
         let stats = json!({"byProvider": {"nodO Personal": {"cost": 1.0}}});
-        let subs = sub_providers_from(&stats, 0.0);
+        let subs = sub_providers_from(&stats, 0.0, &BTreeMap::new());
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].account_id, "nine_router:nodo-personal");
         assert_eq!(subs[0].key, "nodO Personal");
     }
 
     #[test]
+    fn custom_node_uses_its_name_as_label() {
+        // Los nodos personalizados se etiquetan con su id técnico en byProvider;
+        // el nombre visible sale del mapa de /api/provider-nodes.
+        let id = "openai-compatible-responses-1855f0b7-4442-4046-8368-4d11dda27b96";
+        let stats = json!({"byProvider": { id: {"cost": 6.72, "requests": 314} }});
+        let mut names = BTreeMap::new();
+        names.insert(id.to_string(), "QWEN - Alibaba".to_string());
+        let subs = sub_providers_from(&stats, 0.0, &names);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].key, id);
+        assert_eq!(subs[0].label, "QWEN - Alibaba");
+        // El id de cuenta se sanea (minúsculas y guiones), pero sigue buscando por el id real.
+        assert_eq!(subs[0].account_id, format!("nine_router:{}", "openai-compatible-responses-1855f0b7-4442-4046-8368-4d11dda27b96"));
+        let base = UsageReport::new(&subs[0].account_id, "9Router · QWEN", Kind::Api);
+        let r = build_sub(&base, &stats, &subs[0].key, None);
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(r.spend.as_ref().map(|s| s.amount), Some(6.72));
+    }
+
+    #[test]
+    fn custom_node_without_name_falls_back_to_key() {
+        let id = "anthropic-compatible-0c354d0a-4d67-4c4e-a6ff-1360bc9c9344";
+        let stats = json!({"byProvider": { id: {"cost": 6.22} }});
+        let subs = sub_providers_from(&stats, 0.0, &BTreeMap::new());
+        assert_eq!(subs[0].label, id); // sin nombre conocido, la propia clave
+    }
+
+    #[test]
     fn providers_without_spend_are_skipped() {
         let stats = json!({"byProvider": {"free-a": {"cost": 0}, "free-b": {"requests": 100}}});
-        assert!(sub_providers_from(&stats, 0.0).is_empty());
+        assert!(sub_providers_from(&stats, 0.0, &BTreeMap::new()).is_empty());
     }
 
     #[test]
@@ -670,9 +720,9 @@ mod tests {
             "barato": {"cost": 0.5},
             "gratis": {"cost": 0.0}
         }});
-        assert_eq!(account_ids(&sub_providers_from(&stats, 1.0)), vec!["nine_router:caro".to_string()]);
+        assert_eq!(account_ids(&sub_providers_from(&stats, 1.0, &BTreeMap::new())), vec!["nine_router:caro".to_string()]);
         assert_eq!(
-            account_ids(&sub_providers_from(&stats, 0.0)),
+            account_ids(&sub_providers_from(&stats, 0.0, &BTreeMap::new())),
             vec!["nine_router:caro".to_string(), "nine_router:barato".to_string()]
         );
     }
