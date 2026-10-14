@@ -99,8 +99,9 @@ async fn get_json(http: &reqwest::Client, base_url: &str, path: &str, cookie: &s
 
 /// Comprueba que el 9Router responde y hay sesión; devuelve el JSON de stats en crudo
 /// (para el botón «Probar» de Ajustes). Reintenta con la contraseña si la sesión caducó.
-pub async fn probe(http: &reqwest::Client, cfg: &NineRouterConfig) -> Result<String, String> {
-    let base = cfg.base_url.trim_end_matches('/');
+/// `base_override` permite probar contra la URL del borrador de Ajustes sin guardarla.
+pub async fn probe(http: &reqwest::Client, cfg: &NineRouterConfig, base_override: Option<&str>) -> Result<String, String> {
+    let base = base_override.map(str::trim).filter(|b| !b.is_empty()).unwrap_or(&cfg.base_url).trim_end_matches('/');
     // ¿Está vivo? (endpoint público, con CORS abierto)
     http.get(format!("{base}/api/health"))
         .send()
@@ -295,7 +296,8 @@ pub async fn fetch_all(cfg: &NineRouterConfig, http: &reqwest::Client) -> Vec<Us
         .await
         .ok();
 
-    let mut out = vec![build_main(cfg, &main_report, &stats, chart.as_ref())];
+    let today = chrono::Utc::now().date_naive();
+    let mut out = vec![build_main(cfg, &main_report, &stats, chart.as_ref(), today)];
     if cfg.show_sub_providers {
         let cookie = cookie.as_deref().unwrap_or("");
         let node_names = fetch_node_names(http, base, cookie).await;
@@ -307,7 +309,7 @@ pub async fn fetch_all(cfg: &NineRouterConfig, http: &reqwest::Client) -> Vec<Us
                 enabled: true,
                 ..Default::default()
             };
-            out.push(build_sub(&Who::extra(&account).report("9Router", Kind::Api), &stats, &sub.key, chart.as_ref()));
+            out.push(build_sub(&Who::extra(&account).report("9Router", Kind::Api), &stats, &sub.key, chart.as_ref(), today));
         }
     }
     out
@@ -321,7 +323,7 @@ fn status_for(e: &RouterError) -> Status {
 }
 
 /// Sub-proveedor concreto de 9Router (cuenta adicional `nine_router:<id>`).
-fn build_sub(report: &UsageReport, stats: &Value, provider: &str, chart: Option<&Value>) -> UsageReport {
+fn build_sub(report: &UsageReport, stats: &Value, provider: &str, chart: Option<&Value>, today: chrono::NaiveDate) -> UsageReport {
     let mut report = report.clone();
 
     let Some(entry) = stats.get("byProvider").and_then(|b| b.get(provider)).cloned() else {
@@ -337,13 +339,13 @@ fn build_sub(report: &UsageReport, stats: &Value, provider: &str, chart: Option<
     // La serie `/api/usage/chart` es agregada (todos los proveedores): no se puede
     // atribuir a un sub-proveedor sin un desglose por proveedor. Antes de exponer
     // datos de otros, se omite; si la chart trae un campo por proveedor, se usa.
-    report.daily = chart.map(|c| parse_daily_for(c, Some(provider))).unwrap_or_default();
+    report.daily = chart.map(|c| parse_daily_for(c, Some(provider), today)).unwrap_or_default();
     report.message = p.message;
     report
 }
 
 /// Orbe agregador: totales del periodo + sub-proveedores activos.
-fn build_main(cfg: &NineRouterConfig, report: &UsageReport, stats: &Value, chart: Option<&Value>) -> UsageReport {
+fn build_main(cfg: &NineRouterConfig, report: &UsageReport, stats: &Value, chart: Option<&Value>, today: chrono::NaiveDate) -> UsageReport {
     let mut report = report.clone();
     let totals = parse_totals(stats);
 
@@ -378,7 +380,7 @@ fn build_main(cfg: &NineRouterConfig, report: &UsageReport, stats: &Value, chart
         period_label: period_label(&cfg.period),
         budget: cfg.monthly_budget_usd,
     });
-    report.daily = chart.map(parse_daily).unwrap_or_default();
+    report.daily = chart.map(|c| parse_daily(c, today)).unwrap_or_default();
     report.message = Some(format!(
         "{} peticiones · {} tokens · {:.2} $",
         totals.requests, totals.tokens, totals.cost
@@ -440,18 +442,20 @@ fn parse_provider(entry: &Value) -> Parsed {
 /// El `label` de 9Router es una fecha u hora legible («Oct 5», «14:00»); el
 /// frontend espera `YYYY-MM-DD` (le añade `T00:00:00`), así que se normaliza y se
 /// agrupa por día sumando tokens. Lo que no se pueda interpretar se descarta.
-fn parse_daily(chart: &Value) -> Vec<Daily> {
-    parse_daily_for(chart, None)
+/// `today` fija la fecha de referencia para las etiquetas sin año (hora o mes/día);
+/// se inyecta para poder probarlo y para que todas usen el mismo día.
+fn parse_daily(chart: &Value, today: chrono::NaiveDate) -> Vec<Daily> {
+    parse_daily_for(chart, None, today)
 }
 
 /// Igual que `parse_daily`, pero para un sub-proveedor: si la chart trae un
 /// desglose por proveedor, se usa el del indicado; si no, se devuelve vacío en
 /// vez de exponer la serie agregada (que incluiría a los demás).
-fn parse_daily_for(chart: &Value, provider: Option<&str>) -> Vec<Daily> {
+fn parse_daily_for(chart: &Value, provider: Option<&str>, today: chrono::NaiveDate) -> Vec<Daily> {
     let mut by_day: BTreeMap<String, f64> = BTreeMap::new();
     for e in chart.as_array().into_iter().flatten() {
         let Some(label) = e.get("label").and_then(Value::as_str) else { continue };
-        let Some(date) = normalize_day(label) else { continue };
+        let Some(date) = normalize_day(label, today) else { continue };
         let value = match provider {
             None => e.get("tokens").and_then(Value::as_f64).unwrap_or(0.0),
             Some(p) => match e.get("provider").and_then(Value::as_str) {
@@ -466,8 +470,9 @@ fn parse_daily_for(chart: &Value, provider: Option<&str>) -> Vec<Daily> {
 
 /// Normaliza la etiqueta de la chart a `YYYY-MM-DD`. Acepta ISO (`2026-10-05`),
 /// `YYYY-MM-DD HH:MM`, fechas ya completas con hora, y etiquetas cortas de mes y
-/// día (`Oct 5`, `5 Oct`) u horas (`14:00`) sin contexto de año.
-fn normalize_day(label: &str) -> Option<String> {
+/// día (`Oct 5`, `5 Oct`) u horas (`14:00`) sin contexto de año. `today` aporta
+/// el año y el día para las etiquetas que no los traen.
+fn normalize_day(label: &str, today: chrono::NaiveDate) -> Option<String> {
     let label = label.trim();
     if label.is_empty() {
         return None;
@@ -482,18 +487,17 @@ fn normalize_day(label: &str) -> Option<String> {
     }
     // Etiqueta corta de mes y día («Oct 5», «5 Oct»), con el año en curso. El
     // nombre del mes se resuelve a mano para no depender del locale de chrono.
-    let now = chrono::Utc::now();
     let parts: Vec<&str> = label.split_whitespace().collect();
     if let [a, b] = parts[..] {
         let (month_name, day_str) = if month_number(a).is_some() { (a, b) } else { (b, a) };
         if let (Some(month), Ok(day)) = (month_number(month_name), day_str.parse::<u32>()) {
-            return chrono::NaiveDate::from_ymd_opt(now.year(), month, day)
+            return chrono::NaiveDate::from_ymd_opt(today.year(), month, day)
                 .map(|d| d.format("%Y-%m-%d").to_string());
         }
     }
-    // Solo la hora («14:00»): se atribuye al día de hoy.
+    // Solo la hora («14:00»): se atribuye al día de referencia.
     if chrono::NaiveTime::parse_from_str(label, "%H:%M").is_ok() {
-        return Some(now.date_naive().format("%Y-%m-%d").to_string());
+        return Some(today.format("%Y-%m-%d").to_string());
     }
     None
 }
@@ -558,39 +562,54 @@ mod tests {
     fn chart_becomes_daily_series_with_normalized_dates() {
         // La chart trae etiquetas legibles («Oct 5»), horas y fechas ISO. El
         // frontend espera YYYY-MM-DD y añade T00:00:00: hay que normalizar y
-        // agrupar por día (regresión del punto 5 del feedback).
-        let year = chrono::Utc::now().year();
+        // agrupar por día. Fecha de referencia fija para no depender del reloj.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
         let chart = json!([
             {"label": "Oct 5", "tokens": 120},
             {"label": "14:00", "tokens": 30},
-            {"label": format!("{year}-10-05"), "tokens": 5},
+            {"label": "2026-10-05", "tokens": 5},
             {"label": "vaya", "tokens": 999}
         ]);
-        let d = parse_daily(&chart);
-        let oct5 = format!("{year}-10-05");
-        // Tres muestras caen en dos días (Oct 5 y hoy); «vaya» se descarta.
+        let d = parse_daily(&chart, today);
+        // Todas las claves son YYYY-MM-DD; «vaya» se descarta.
         assert!(d.iter().all(|x| x.date.len() == 10 && x.date.as_bytes()[4] == b'-'));
         let total: f64 = d.iter().map(|x| x.value).sum();
         assert!((total - 155.0).abs() < 1e-6, "total inesperado: {total}");
-        // Las dos etiquetas del 5 de octubre se agrupan en una sola entrada.
-        let oct5_total: f64 = d.iter().filter(|x| x.date == oct5).map(|x| x.value).sum();
+        // «Oct 5» y la ISO del 5 se agrupan en una sola entrada (con el año de `today`).
+        let oct5_total: f64 = d.iter().filter(|x| x.date == "2026-10-05").map(|x| x.value).sum();
         assert!((oct5_total - 125.0).abs() < 1e-6, "oct5 inesperado: {oct5_total}");
+        // La hora («14:00») se atribuye al día de referencia.
+        assert!(d.iter().any(|x| x.date == "2026-10-20" && (x.value - 30.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn normalize_day_uses_injected_date_not_the_clock() {
+        // Regresión del punto 5: la fecha base se inyecta; no se lee el reloj.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 9).unwrap();
+        assert_eq!(normalize_day("Oct 5", today).as_deref(), Some("2026-10-05"));
+        assert_eq!(normalize_day("5 Oct", today).as_deref(), Some("2026-10-05"));
+        assert_eq!(normalize_day("14:00", today).as_deref(), Some("2026-03-09"));
+        assert_eq!(normalize_day("2025-12-31", today).as_deref(), Some("2025-12-31"));
+        assert_eq!(normalize_day("2025-12-31 23:59", today).as_deref(), Some("2025-12-31"));
+        assert_eq!(normalize_day("vaya", today), None);
     }
 
     #[test]
     fn sub_series_is_empty_without_per_provider_breakdown() {
         // La chart es agregada: un sub-proveedor no debe mostrar tokens de otros.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
         let chart = json!([{"label": "Oct 5", "tokens": 120}]);
-        assert!(parse_daily_for(&chart, Some("claude")).is_empty());
+        assert!(parse_daily_for(&chart, Some("claude"), today).is_empty());
     }
 
     #[test]
     fn sub_series_uses_per_provider_field_when_present() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
         let chart = json!([
             {"label": "Oct 5", "tokens": 120, "provider": "claude"},
             {"label": "Oct 5", "tokens": 80, "provider": "kiro"}
         ]);
-        let d = parse_daily_for(&chart, Some("claude"));
+        let d = parse_daily_for(&chart, Some("claude"), today);
         assert_eq!(d.len(), 1);
         assert!((d[0].value - 120.0).abs() < 1e-6);
     }
@@ -614,7 +633,7 @@ mod tests {
         let cfg = NineRouterConfig { monthly_budget_usd: Some(100.0), ..Default::default() };
         let stats = json!({"totalRequests": 10, "totalPromptTokens": 400, "totalCompletionTokens": 100, "totalCost": 50.0,
             "byProvider": {"claude": {}, "kiro": {}}});
-        let r = build_main(&cfg, &UsageReport::new("nine_router", "9Router", Kind::Api), &stats, None);
+        let r = build_main(&cfg, &UsageReport::new("nine_router", "9Router", Kind::Api), &stats, None, chrono::Utc::now().date_naive());
         assert_eq!(r.meters[0].label, "Gasto (periodo)");
         assert_eq!(r.meters[0].percent, Some(50.0));
         assert_eq!(r.plan.as_deref(), Some("2 proveedores"));
@@ -665,7 +684,7 @@ mod tests {
         assert_eq!(kiro.label, "Kiro");
         // `build_sub` con la clave original encuentra el desglose (no cae en Warning).
         let base = UsageReport::new("nine_router:kiro", "9Router · Kiro", Kind::Api);
-        let r = build_sub(&base, &stats, &kiro.key, None);
+        let r = build_sub(&base, &stats, &kiro.key, None, chrono::Utc::now().date_naive());
         assert_eq!(r.status, Status::Ok);
         assert_eq!(r.spend.as_ref().map(|s| s.amount), Some(0.5));
     }
@@ -694,7 +713,7 @@ mod tests {
         // El id de cuenta se sanea (minúsculas y guiones), pero sigue buscando por el id real.
         assert_eq!(subs[0].account_id, format!("nine_router:{}", "openai-compatible-responses-1855f0b7-4442-4046-8368-4d11dda27b96"));
         let base = UsageReport::new(&subs[0].account_id, "9Router · QWEN", Kind::Api);
-        let r = build_sub(&base, &stats, &subs[0].key, None);
+        let r = build_sub(&base, &stats, &subs[0].key, None, chrono::Utc::now().date_naive());
         assert_eq!(r.status, Status::Ok);
         assert_eq!(r.spend.as_ref().map(|s| s.amount), Some(6.72));
     }

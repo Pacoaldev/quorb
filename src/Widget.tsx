@@ -13,6 +13,7 @@ import { ORB_SIZE, type AppConfig, type UsageReport } from './lib/types';
 import { checkForUpdate, emitUpdateAvailable, installUpdate, shouldNotifyUpdate, updateErrorText, UPDATE_EVERY_MS, UPDATE_FIRST_DELAY_MS, type UpdatePhase } from './lib/updater';
 import { retryWithBackoff, STARTUP_RETRY, USAGE_RETRY } from './lib/startup';
 import { createSessionMonitor } from './lib/session-monitor';
+import { needsRefresh } from './lib/widget-refresh';
 import { DETAIL_EVENTS, DETAIL_WINDOW, isCurrentDetailInteraction, type DetailInteraction, type DetailState } from './lib/detail-panel';
 import { ProviderGauge } from './components/ProviderGauge';
 import { accountTags } from './lib/accounts';
@@ -63,8 +64,6 @@ async function resolveGeo(name: string | null): Promise<Geo | null> {
 }
 
 /** Campos que, si cambian, obligan a volver a pedir datos. */
-const dataKey = (c: AppConfig | null) =>
-  c ? JSON.stringify([c.claude, c.codex, c.gemini, c.cursor, c.copilot, c.openrouter, c.anthropicApi, c.openaiApi, c.nan]) : '';
 
 // Pequeñas preferencias locales del widget (no críticas).
 const local = {
@@ -286,7 +285,7 @@ export function Widget() {
         const next = await api.getConfig();
         applyConfig(next);
         // Mover la tira o cambiar colores no debe disparar peticiones a los proveedores.
-        if (dataKey(prev) !== dataKey(next)) refresh();
+        if (needsRefresh(prev, next)) refresh();
       }),
       listen('refresh-now', () => refresh()),
       listen('open-peak', () => openPeakRef.current()),

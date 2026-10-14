@@ -77,8 +77,9 @@ export const api = {
   /**
    * 9Router: guarda la contraseña del dashboard local, inicia sesión y devuelve
    * las stats en crudo. La cookie de sesión la conserva el backend.
+   * `baseUrl` es la del borrador de Ajustes (si el usuario la cambió sin guardar).
    */
-  nineRouterLogin: (password: string) => invoke<string>('nine_router_login', { password }),
+  nineRouterLogin: (password: string, baseUrl?: string) => invoke<string>('nine_router_login', { password, baseUrl: baseUrl ?? null }),
   /** 9Router: desconecta borrando contraseña y cookie de sesión guardadas. */
   nineRouterLogout: () => invoke<void>('nine_router_logout'),
   /** Rectángulo del monitor en píxeles físicos */

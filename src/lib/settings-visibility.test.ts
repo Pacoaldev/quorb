@@ -60,4 +60,17 @@ describe('obsolete hidden-circles block (#98)', () => {
     expect(setAccountVisibility(cfg, 'constructor', true)).toBe(cfg);
     expect(setAccountVisibility(cfg, 'missing', true)).toBe(cfg);
   });
+
+  it('reactivating 9Router restores its aggregate orb and every sub-orb', () => {
+    // Regresión del punto 1: 9Router no tiene id único en CONFIG_KEY; activarlo
+    // debe recuperar el orbe agregado y todos los sub-orbes ocultados.
+    const cfg = { ...fixture(), nineRouter: { enabled: false }, hiddenProviders: ['nine_router', 'nine_router:kiro', 'claude'] } as unknown as AppConfig;
+    const next = setAccountVisibility(cfg, 'nine_router', true);
+    expect(next.nineRouter.enabled).toBe(true);
+    expect(next.hiddenProviders).toEqual(['claude']);
+    // Desactivar no limpia ocultaciones (como el resto de proveedores).
+    const off = setAccountVisibility({ ...cfg, nineRouter: { enabled: true } } as unknown as AppConfig, 'nine_router', false);
+    expect(off.nineRouter.enabled).toBe(false);
+    expect(off.hiddenProviders).toContain('nine_router:kiro');
+  });
 });
