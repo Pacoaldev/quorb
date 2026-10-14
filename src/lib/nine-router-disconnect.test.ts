@@ -1,4 +1,6 @@
 import settingsSource from '../Settings.tsx?raw';
+import libSource from '../../src-tauri/src/lib.rs?raw';
+import nineRouterSource from '../../src-tauri/src/providers/nine_router.rs?raw';
 import { describe, expect, it } from 'vitest';
 
 // Contrato de la desconexión de 9Router (regresión del punto 2 del feedback):
@@ -16,5 +18,24 @@ describe('9Router disconnect', () => {
   it('prueba el login contra la Base URL del borrador', () => {
     expect(settingsSource).toContain('api.nineRouterLogin(value, baseUrl)');
     expect(settingsSource).toContain('baseUrl={cfg.nineRouter.baseUrl}');
+  });
+
+  // Regresión del punto P1 (3er feedback): la prueba contra la URL del borrador no
+  // debe mezclar credenciales entre servidores. Si el destino difiere del
+  // persistido, se prueba con una sesión temporal aislada y no se guarda nada.
+  it('no persiste credenciales cuando el destino del borrador difiere', () => {
+    expect(libSource).toContain('same_destination');
+    expect(libSource).toContain('probe_with_password');
+    expect(nineRouterSource).toContain('pub fn same_destination');
+    expect(nineRouterSource).toContain('pub async fn probe_with_password');
+    // La prueba aislada no toca los secretos globales.
+    expect(nineRouterSource).toContain('/// destino). No lee ni escribe los secretos globales.');
+  });
+
+  // Regresión del punto P3 (3er feedback): el flujo «cambios sin guardar» del paso
+  // de conexión debe mapear 9Router a su clave de config; sin ella, `sectionDirty`
+  // no detectaba el borrador y «Comprobar ahora» usaba el destino persistido.
+  it('mapea nine_router a su clave de config para el aviso de cambios sin guardar', () => {
+    expect(settingsSource).toContain("nine_router: 'nineRouter'");
   });
 });

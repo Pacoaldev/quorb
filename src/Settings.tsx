@@ -1009,6 +1009,12 @@ const CONFIG_KEY: Record<string, keyof AppConfig> = {
   openrouter: 'openrouter',
   anthropic_api: 'anthropicApi',
   openai_api: 'openaiApi',
+  // 9Router no entra por el flujo genérico de visibilidad (su rama de orbes
+  // ocultos es propia), pero sí necesita esta clave para que `sectionDirty`
+  // detecte el borrador (p. ej. la Base URL cambiada sin guardar) en el paso de
+  // conexión; sin ella, «Comprobar ahora» consultaba el destino persistido como
+  // si no hubiera cambios sin guardar.
+  nine_router: 'nineRouter',
 };
 
 const PROVIDER_TABS = [
