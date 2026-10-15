@@ -121,19 +121,21 @@ fn update_config(
 
 #[tauri::command]
 fn save_config(app: AppHandle, state: State<'_, AppState>, config: AppConfig) -> Result<AppConfig, String> {
+    // P1 (5º feedback): si el destino de 9Router cambia, hay que confirmar el
+    // borrado de secretos *antes* de publicar la URL nueva. Publicar B y borrar
+    // después deja una ventana (y un fallo silencioso del almacén) donde un
+    // refresco concurrente lee B con credenciales de A.
+    let old_base = state.config.lock().unwrap().nine_router.base_url.clone();
+    invalidate_nine_router_before_destination_publish(
+        old_base.trim(),
+        config.nine_router.base_url.trim(),
+        forget_nine_router_secrets,
+    )?;
+
     let (old, config) = update_config(&state, |current| *current = config)?;
     // Las cuentas eliminadas se llevan sus secretos del almacén del sistema.
     for gone in old.accounts.iter().filter(|a| !config.accounts.iter().any(|b| b.id == a.id)) {
         secrets::forget_account(gone);
-    }
-    // P1 (4º feedback): los secretos de 9Router (contraseña/cookie) pertenecen al
-    // servidor con el que se conectaron, no van asociados a una URL. Si el guardado
-    // cambia la Base URL, los secretos guardados son del destino antiguo: dejarlos
-    // haría que el siguiente fetch enviara credenciales de A a B (o al revés),
-    // rompiendo la conexión y exponiendo credenciales a un destino distinto. Se
-    // invalidan para forzar una reconexión contra el destino nuevo.
-    if nine_router_destination_changed(old.nine_router.base_url.trim(), config.nine_router.base_url.trim()) {
-        forget_nine_router_secrets();
     }
     let old_shortcuts = old.shortcuts;
     if old_shortcuts != config.shortcuts {
@@ -152,14 +154,36 @@ fn save_config(app: AppHandle, state: State<'_, AppState>, config: AppConfig) ->
 /// los espacios. Cuando cambia, las credenciales guardadas (del destino anterior)
 /// dejan de ser válidas para el nuevo y hay que invalidarlas.
 fn nine_router_destination_changed(old_base: &str, new_base: &str) -> bool {
-    old_base.trim().trim_end_matches('/') != new_base.trim().trim_end_matches('/')
+    providers::nine_router::normalize_base(old_base) != providers::nine_router::normalize_base(new_base)
 }
 
-/// Borra la contraseña **y** la cookie de 9Router. Con solo la contraseña borrada,
-/// la cookie seguiría dando acceso hasta caducar (y pertenece al destino viejo).
-fn forget_nine_router_secrets() {
-    let _ = secrets::set(secrets::NINE_ROUTER_PASSWORD, "");
-    let _ = secrets::set(secrets::NINE_ROUTER_SESSION, "");
+/// Orden fail-safe al cambiar destino: invalidar secretos y solo entonces permitir
+/// publicar la URL nueva. Si `forget` falla, el caller no debe persistir B.
+/// Devuelve `true` cuando hubo que invalidar.
+fn invalidate_nine_router_before_destination_publish(
+    old_base: &str,
+    new_base: &str,
+    forget: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    if !nine_router_destination_changed(old_base, new_base) {
+        return Ok(false);
+    }
+    forget()?;
+    Ok(true)
+}
+
+/// Borra contraseña, cookie **y** vínculo al destino. Propaga el error si el
+/// almacén rechaza cualquiera: no se informa éxito ni se publica un destino nuevo.
+fn forget_nine_router_secrets() -> Result<(), String> {
+    let pass = secrets::set(secrets::NINE_ROUTER_PASSWORD, "");
+    let sess = secrets::set(secrets::NINE_ROUTER_SESSION, "");
+    let bound = secrets::set(secrets::NINE_ROUTER_BOUND_URL, "");
+    match (pass, sess, bound) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            Err(format!("No se pudieron borrar las credenciales de 9Router: {e}"))
+        }
+    }
 }
 
 /// Merge atómico de los campos del widget sobre la config actual: nunca toca
@@ -227,10 +251,9 @@ async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password:
         .filter(|u| !u.is_empty());
     let base = draft_base.clone().unwrap_or_else(|| saved_base.to_string());
     if providers::nine_router::same_destination(saved_base, draft_base.as_deref()) {
-        // Destino idéntico al persistido: se guarda la contraseña y la cookie.
+        // Destino idéntico al persistido: se guarda contraseña, cookie y vínculo.
         let cookie = providers::nine_router::login(&state.http, &base, &password).await?;
-        secrets::set(secrets::NINE_ROUTER_PASSWORD, &password)?;
-        secrets::set(secrets::NINE_ROUTER_SESSION, &cookie)?;
+        providers::nine_router::persist_credentials(&base, &password, &cookie)?;
         let _ = app.emit("config-changed", ());
         // P2 (4º feedback): la conexión no cambia la config, así que `config-changed`
         // no obliga a refrescar los datos del widget (que se refrescan por
@@ -244,11 +267,11 @@ async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password:
     }
 }
 
-/// Desconecta 9Router: borra la contraseña **y** la cookie de sesión guardadas.
-/// Con solo la contraseña borrada, la cookie seguiría dando acceso hasta caducar.
+/// Desconecta 9Router: borra contraseña, cookie y vínculo al destino.
+/// Si el almacén no confirma el borrado, se propaga el error (no se informa éxito).
 #[tauri::command]
 fn nine_router_logout(app: AppHandle) -> Result<(), String> {
-    forget_nine_router_secrets();
+    forget_nine_router_secrets()?;
     let _ = app.emit("config-changed", ());
     // P2 (4º feedback): desconectar también debe refrescar el widget al instante
     // (misma razón que en el login: la config no cambia, solo la sesión).
@@ -733,6 +756,57 @@ mod tests {
         assert!(nine_router_destination_changed("http://localhost:20128", "http://localhost:3000"));
         assert!(nine_router_destination_changed("http://localhost:20128", "http://otro-host:20128"));
         assert!(nine_router_destination_changed("http://localhost:20128", "https://localhost:20128"));
+    }
+
+    /// P1 (5º feedback): si el almacén rechaza el borrado, no se puede publicar B.
+    #[test]
+    fn destination_change_refuses_publish_when_forget_fails() {
+        let err = invalidate_nine_router_before_destination_publish(
+            "http://localhost:20128",
+            "http://localhost:3000",
+            || Err("store locked".into()),
+        )
+        .expect_err("forget fallido debe abortar el guardado de B");
+        assert!(err.contains("store locked"));
+    }
+
+    /// P1 (5º feedback): el borrado ocurre (y debe completarse) antes de que el
+    /// caller publique el destino nuevo — orden fail-safe frente a refrescos.
+    #[test]
+    fn destination_change_forgets_before_caller_may_publish() {
+        let mut forgot = false;
+        let mut published = false;
+        let changed = invalidate_nine_router_before_destination_publish(
+            "http://a:20128",
+            "http://b:20128",
+            || {
+                assert!(!published, "no publicar B antes de invalidar");
+                forgot = true;
+                Ok(())
+            },
+        )
+        .expect("forget ok");
+        assert!(changed);
+        assert!(forgot);
+        // Solo tras Ok el caller puede persistir/publicar B.
+        published = true;
+        assert!(published && forgot);
+    }
+
+    #[test]
+    fn same_destination_skips_forget() {
+        let mut forgot = false;
+        let changed = invalidate_nine_router_before_destination_publish(
+            "http://localhost:20128/",
+            "http://localhost:20128",
+            || {
+                forgot = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!changed);
+        assert!(!forgot);
     }
 
     /// Carpeta temporal propia de cada prueba: sin dependencias nuevas y sin

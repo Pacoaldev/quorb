@@ -42,9 +42,15 @@ describe('9Router disconnect', () => {
 
   // 4º feedback P1: guardar una Base URL distinta debe invalidar los secretos del
   // destino anterior (si no, el siguiente fetch envía credenciales de A a B).
+  // 5º feedback P1: invalidar ANTES de publicar B, propagar errores del almacén,
+  // y vincular secretos al destino (bound_url) para consultas concurrentes.
   it('save_config invalida los secretos al cambiar la Base URL de 9Router', () => {
     expect(libSource).toContain('nine_router_destination_changed');
     expect(libSource).toContain('forget_nine_router_secrets');
+    expect(libSource).toContain('invalidate_nine_router_before_destination_publish');
+    expect(libSource).toContain('forget_nine_router_secrets()?');
+    expect(libSource).toContain('NINE_ROUTER_BOUND_URL');
+    expect(libSource).toContain('persist_credentials');
   });
 
   // 4º feedback P2: conectar/desconectar no cambia la config, así que se necesita

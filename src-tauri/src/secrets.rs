@@ -21,8 +21,11 @@ pub const CURSOR_TOKEN: &str = "cursor_token";
 pub const NINE_ROUTER_PASSWORD: &str = "nine_router_password";
 /// Cookie de sesión del dashboard de 9Router (`auth_token`, dura 24 h).
 pub const NINE_ROUTER_SESSION: &str = "nine_router_session";
+/// Base URL a la que pertenecen contraseña/cookie. Sin este vínculo, o si no
+/// coincide con el destino actual, no se envían (evita credenciales de A en B).
+pub const NINE_ROUTER_BOUND_URL: &str = "nine_router_bound_url";
 
-pub const ALL: [&str; 9] = [
+pub const ALL: [&str; 10] = [
     ANTHROPIC_ADMIN_KEY,
     OPENAI_ADMIN_KEY,
     NAN_API_KEY,
@@ -32,6 +35,7 @@ pub const ALL: [&str; 9] = [
     CURSOR_TOKEN,
     NINE_ROUTER_PASSWORD,
     NINE_ROUTER_SESSION,
+    NINE_ROUTER_BOUND_URL,
 ];
 
 /// Secretos que usa cada proveedor (las cuentas extra guardan los suyos con sufijo).
@@ -43,8 +47,8 @@ pub fn for_provider(provider: &str) -> &'static [&'static str] {
         "anthropic_api" => &[ANTHROPIC_ADMIN_KEY],
         "openai_api" => &[OPENAI_ADMIN_KEY],
         "nan" => &[NAN_API_KEY, NAN_SESSION],
-        // La sesión (cookie) la gestiona el backend; la contraseña la introduce el usuario.
-        "nine_router" => &[NINE_ROUTER_PASSWORD, NINE_ROUTER_SESSION],
+        // Contraseña + cookie + vínculo al destino (el bound_url no se edita en UI).
+        "nine_router" => &[NINE_ROUTER_PASSWORD, NINE_ROUTER_SESSION, NINE_ROUTER_BOUND_URL],
         _ => &[],
     }
 }
@@ -139,8 +143,10 @@ mod tests {
     fn nine_router_forgets_password_and_session_together() {
         // Regresión del punto 2: desconectar 9Router debe cubrir ambos secretos;
         // con solo la contraseña borrada, la cookie seguiría dando acceso 24 h.
+        // P1 (5º feedback): también el vínculo al destino (bound_url).
         let keys = for_provider("nine_router");
         assert!(keys.contains(&NINE_ROUTER_PASSWORD));
         assert!(keys.contains(&NINE_ROUTER_SESSION));
+        assert!(keys.contains(&NINE_ROUTER_BOUND_URL));
     }
 }
