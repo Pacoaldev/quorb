@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { findLogo, normalizeLogoKey, subLogoKey } from '../components/ProviderLogo';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { findLogo, normalizeLogoKey, ProviderLogo, subLogoKey } from '../components/ProviderLogo';
 
 // Los nodos personalizados de 9Router se etiquetan con su id técnico en
 // `byProvider`; el nombre visible llega en el `name` del informe («9Router · Zhipu»).
@@ -12,9 +14,25 @@ describe('9Router custom node logo keys', () => {
     ).toBe('qwen-alibaba');
   });
 
-  it('resolves those names to a real logo file through aliases', () => {
-    expect(findLogo(subLogoKey('nine_router:anthropic-compatible-x', '9Router · Zhipu'))).toBeDefined();
-    expect(findLogo(subLogoKey('nine_router:openai-compatible-responses-x', '9Router · QWEN - Alibaba'))).toBeDefined();
+  it('renders monograms for sub-providers without an SVG', () => {
+    for (const [id, name, monogram] of [
+      ['nine_router:anthropic-compatible-x', '9Router · Zhipu', 'ZH'],
+      ['nine_router:openai-compatible-responses-x', '9Router · QWEN - Alibaba', 'QA'],
+    ]) {
+      expect(findLogo(subLogoKey(id, name))).toBeUndefined();
+      const markup = renderToStaticMarkup(createElement(ProviderLogo, { id, name }));
+      expect(markup).toContain('logo__mono');
+      expect(markup).toContain(`>${monogram}<`);
+    }
+  });
+
+  it('does not include a PNG provider catalog', () => {
+    expect(Object.keys(import.meta.glob('../assets/logos/*.png'))).toHaveLength(0);
+  });
+
+  it('keeps existing SVG logos for Codex and Copilot', () => {
+    expect(findLogo('codex')?.kind).toBe('svg');
+    expect(findLogo('copilot')?.kind).toBe('svg');
   });
 
   it('keeps the sanitized sub id for known providers without a custom name', () => {
