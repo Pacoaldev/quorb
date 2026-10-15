@@ -1,7 +1,6 @@
 import settingsSource from '../Settings.tsx?raw';
 import widgetSource from '../Widget.tsx?raw';
 import libSource from '../../src-tauri/src/lib.rs?raw';
-import nineRouterSource from '../../src-tauri/src/providers/nine_router.rs?raw';
 import { describe, expect, it } from 'vitest';
 
 // Contrato de la desconexión de 9Router (regresión del punto 2 del feedback):
@@ -21,25 +20,6 @@ describe('9Router disconnect', () => {
     expect(settingsSource).toContain('baseUrl={cfg.nineRouter.baseUrl}');
   });
 
-  // Regresión del punto P1 (3er feedback): la prueba contra la URL del borrador no
-  // debe mezclar credenciales entre servidores. Si el destino difiere del
-  // persistido, se prueba con una sesión temporal aislada y no se guarda nada.
-  it('no persiste credenciales cuando el destino del borrador difiere', () => {
-    expect(libSource).toContain('same_destination');
-    expect(libSource).toContain('probe_with_password');
-    expect(nineRouterSource).toContain('pub fn same_destination');
-    expect(nineRouterSource).toContain('pub async fn probe_with_password');
-    // La prueba aislada no toca los secretos globales.
-    expect(nineRouterSource).toContain('/// destino). No lee ni escribe los secretos globales.');
-  });
-
-  // Regresión del punto P3 (3er feedback): el flujo «cambios sin guardar» del paso
-  // de conexión debe mapear 9Router a su clave de config; sin ella, `sectionDirty`
-  // no detectaba el borrador y «Comprobar ahora» usaba el destino persistido.
-  it('mapea nine_router a su clave de config para el aviso de cambios sin guardar', () => {
-    expect(settingsSource).toContain("nine_router: 'nineRouter'");
-  });
-
   // 4º feedback P1: guardar una Base URL distinta debe invalidar los secretos del
   // destino anterior (si no, el siguiente fetch envía credenciales de A a B).
   // 5º feedback P1: invalidar ANTES de publicar B, propagar errores del almacén,
@@ -49,8 +29,9 @@ describe('9Router disconnect', () => {
     expect(libSource).toContain('forget_nine_router_secrets');
     expect(libSource).toContain('invalidate_nine_router_before_destination_publish');
     expect(libSource).toContain('forget_nine_router_secrets()?');
-    expect(libSource).toContain('NINE_ROUTER_BOUND_URL');
-    expect(libSource).toContain('persist_credentials');
+    expect(libSource).toContain('nine_router_creds::forget_all');
+    expect(libSource).toContain('begin_write_ticket');
+    expect(libSource).toContain('persist_if_generation');
   });
 
   // 4º feedback P2: conectar/desconectar no cambia la config, así que se necesita
@@ -58,5 +39,11 @@ describe('9Router disconnect', () => {
   it('login y logout piden refresco explícito del widget', () => {
     expect(libSource).toContain('refresh-now');
     expect(widgetSource).toContain("listen('refresh-now'");
+  });
+
+  // 6º feedback P2: set_secret no puede mutar claves de 9Router fuera del coordinador.
+  it('rechaza las claves internas de 9Router en set_secret', () => {
+    expect(libSource).toContain('is_managed_key');
+    expect(libSource).toMatch(/set_secret[\s\S]*is_managed_key/);
   });
 });

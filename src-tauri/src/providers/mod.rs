@@ -10,6 +10,7 @@ pub mod gemini;
 pub mod nan;
 pub mod nan_cloud;
 pub mod nine_router;
+pub mod nine_router_creds;
 pub mod openai_api;
 pub mod openrouter;
 

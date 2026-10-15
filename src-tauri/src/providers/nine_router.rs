@@ -15,7 +15,6 @@
 use super::{net_error, Who};
 use crate::config::NineRouterConfig;
 use crate::model::{Daily, Kind, Meter, Spend, Status, UsageReport};
-use crate::secrets;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -35,10 +34,7 @@ impl RouterError {
     }
 }
 
-/// Normaliza una Base URL de 9Router para comparar destinos (trim + sin `/` final).
-pub fn normalize_base(url: &str) -> String {
-    url.trim().trim_end_matches('/').to_string()
-}
+pub use super::nine_router_creds::normalize_base;
 
 /// ¿El destino del borrador coincide con el persistido? Compara ignorando la
 /// barra final. `None` (sin borrador) se considera el persistido. Cuando NO
@@ -51,28 +47,6 @@ pub fn same_destination(saved: &str, draft: Option<&str>) -> bool {
     }
 }
 
-/// ¿Las credenciales guardadas pertenecen a este destino? Sin `bound_url`, o si
-/// apunta a otro servidor, no se envían (A → guardar B → refrescar no puede
-/// mandar la cookie/contraseña de A a B, ni en una consulta concurrente).
-pub fn credentials_bound_to(base: &str) -> bool {
-    match secrets::get(secrets::NINE_ROUTER_BOUND_URL) {
-        Some(bound) => normalize_base(&bound) == normalize_base(base),
-        None => false,
-    }
-}
-
-/// Persiste contraseña, cookie y el destino al que pertenecen. Los tres o nada
-/// a nivel de llamada: si falla el vínculo, se intenta limpiar lo ya escrito.
-pub fn persist_credentials(base: &str, password: &str, cookie: &str) -> Result<(), String> {
-    secrets::set(secrets::NINE_ROUTER_PASSWORD, password)?;
-    secrets::set(secrets::NINE_ROUTER_SESSION, cookie)?;
-    if let Err(e) = secrets::set(secrets::NINE_ROUTER_BOUND_URL, &normalize_base(base)) {
-        let _ = secrets::set(secrets::NINE_ROUTER_PASSWORD, "");
-        let _ = secrets::set(secrets::NINE_ROUTER_SESSION, "");
-        return Err(e);
-    }
-    Ok(())
-}
 
 /// Inicia sesión en el dashboard local y devuelve la cabecera `Cookie` resultante.
 /// `POST /api/auth/login { "password": … }` → `Set-Cookie: auth_token=…`.
@@ -108,17 +82,18 @@ pub async fn login(http: &reqwest::Client, base_url: &str, password: &str) -> Re
 }
 
 /// Inicia sesión con la contraseña guardada y guarda la cookie resultante.
-/// `None` si no hay contraseña o si pertenece a otro destino (no se envía a B).
+/// `None` si no hay contraseña, otro destino, o las credenciales cambiaron durante el `.await`.
 pub async fn login_with_saved(http: &reqwest::Client, base_url: &str) -> Result<Option<String>, String> {
-    if !credentials_bound_to(base_url) {
-        return Ok(None);
-    }
-    let Some(password) = secrets::get(secrets::NINE_ROUTER_PASSWORD) else {
+    use super::nine_router_creds::{password_ticket_for_base, persist_if_generation, PersistError};
+    let Some((generation, password)) = password_ticket_for_base(base_url) else {
         return Ok(None);
     };
     let cookie = login(http, base_url, &password).await?;
-    persist_credentials(base_url, &password, &cookie)?;
-    Ok(Some(cookie))
+    match persist_if_generation(base_url, &password, &cookie, generation) {
+        Ok(()) => Ok(Some(cookie)),
+        Err(PersistError::Stale) => Ok(None),
+        Err(PersistError::Store(e)) => Err(e),
+    }
 }
 
 /// `GET` con la cookie de sesión; `Expired` si 401/403. Sin cookie (login del
@@ -149,21 +124,18 @@ pub async fn probe(http: &reqwest::Client, cfg: &NineRouterConfig, base_override
         .await
         .map_err(|e| format!("No encuentro 9Router en {base}: {}", net_error(e)))?;
 
-    // Solo reutiliza la cookie si está vinculada a este destino; si no, login
-    // (también gated) o error — nunca envía credenciales de otro servidor.
-    let cookie = if credentials_bound_to(base) {
-        match secrets::get(secrets::NINE_ROUTER_SESSION) {
+    let cookie = match super::nine_router_creds::snapshot_for_base(base) {
+        Some(snap) => match snap.session {
             Some(c) => c,
             None => match login_with_saved(http, base).await? {
                 Some(c) => c,
                 None => return Err("Configura la contraseña del dashboard de 9Router.".into()),
             },
-        }
-    } else {
-        match login_with_saved(http, base).await? {
+        },
+        None => match login_with_saved(http, base).await? {
             Some(c) => c,
             None => return Err("Configura la contraseña del dashboard de 9Router.".into()),
-        }
+        },
     };
     match get_stats(http, base, &cfg.period, &cookie).await {
         Ok(v) => Ok(serde_json::to_string_pretty(&v).unwrap_or_default()),
@@ -339,23 +311,20 @@ pub async fn fetch_all(cfg: &NineRouterConfig, http: &reqwest::Client) -> Vec<Us
     let main_report = main_who.report("9Router", Kind::Api);
     let base = cfg.base_url.trim_end_matches('/');
 
-    // Sesión: solo si está vinculada a este destino. Si el bound apunta a otro
-    // servidor (o falta), no se envía: se intenta login gated o lectura sin cookie
-    // (login del dashboard desactivado). Así A → guardar B → refrescar no manda
-    // credenciales de A a B, tampoco en una consulta concurrente.
-    let mut cookie = if credentials_bound_to(base) {
-        match secrets::get(secrets::NINE_ROUTER_SESSION) {
+    // Sesión: snapshot coherente (bound + cookie + generación). Evita validar A y
+    // leer la cookie de B si otro hilo guardó/conectó entretanto.
+    let mut cookie = match super::nine_router_creds::snapshot_for_base(base) {
+        Some(snap) => match snap.session {
             Some(c) => Some(c),
             None => match login_with_saved(http, base).await {
                 Ok(c) => c,
                 Err(e) => return vec![main_report.fail(Status::Error, e)],
             },
-        }
-    } else {
-        match login_with_saved(http, base).await {
+        },
+        None => match login_with_saved(http, base).await {
             Ok(c) => c,
             Err(e) => return vec![main_report.fail(Status::Error, e)],
-        }
+        },
     };
 
     let stats = match read_stats(http, base, &cfg.period, &mut cookie).await {
@@ -777,14 +746,12 @@ mod tests {
     }
 
     #[test]
-    fn credentials_bound_to_rejects_cross_destination() {
-        // P1 (5º feedback): A → guardar B → refrescar / consulta concurrente.
-        // La comparación es pura sobre URLs normalizadas (el get del almacén se
-        // cubre en integración; aquí el contrato de igualdad de destino).
+    fn snapshot_for_base_rejects_cross_destination() {
+        // P1 (6º feedback): lectura coherente — la normalización de destino se
+        // prueba aquí; interleavings en nine_router_creds::tests.
         assert_eq!(normalize_base("  http://a:1/  "), "http://a:1");
         assert_eq!(normalize_base("http://a:1"), normalize_base("http://a:1/"));
         assert_ne!(normalize_base("http://a:1"), normalize_base("http://b:1"));
-        // Misma normalización que usa credentials_bound_to al comparar bound vs base.
         assert!(same_destination("http://a:1/", Some("http://a:1")));
         assert!(!same_destination("http://a:1", Some("http://b:1")));
     }
