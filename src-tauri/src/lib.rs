@@ -208,18 +208,9 @@ fn invalidate_nine_router_before_destination_publish(
     Ok(true)
 }
 
-/// Borra contraseña, cookie **y** vínculo al destino. Propaga el error si el
-/// almacén rechaza cualquiera: no se informa éxito ni se publica un destino nuevo.
+/// Borra contraseña, cookie **y** vínculo al destino. Invalida renovaciones pendientes.
 fn forget_nine_router_secrets() -> Result<(), String> {
-    let pass = secrets::set(secrets::NINE_ROUTER_PASSWORD, "");
-    let sess = secrets::set(secrets::NINE_ROUTER_SESSION, "");
-    let bound = secrets::set(secrets::NINE_ROUTER_BOUND_URL, "");
-    match (pass, sess, bound) {
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-            Err(format!("No se pudieron borrar las credenciales de 9Router: {e}"))
-        }
-    }
+    providers::nine_router_creds::forget_all()
 }
 
 /// Merge atómico de los campos del widget sobre la config actual: nunca toca

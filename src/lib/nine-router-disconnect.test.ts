@@ -29,7 +29,7 @@ describe('9Router disconnect', () => {
     expect(libSource).toContain('forget_nine_router_secrets');
     expect(libSource).toContain('invalidate_nine_router_before_destination_publish');
     expect(libSource).toContain('forget_nine_router_secrets()?');
-    expect(libSource).toContain('NINE_ROUTER_BOUND_URL');
+    expect(libSource).toContain('nine_router_creds::forget_all');
     expect(libSource).toContain('persist_credentials');
   });
 
