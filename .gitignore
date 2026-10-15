@@ -7,3 +7,7 @@ src-tauri/gen
 .codegraph/
 .atl/
 docs/odd/
+# El proyecto usa npm (lockfile tracked: package-lock.json). pnpm-* son artefactos
+# locales cuando alguien instala con pnpm por error.
+pnpm-lock.yaml
+pnpm-workspace.yaml
