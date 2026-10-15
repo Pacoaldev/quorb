@@ -30,7 +30,8 @@ describe('9Router disconnect', () => {
     expect(libSource).toContain('invalidate_nine_router_before_destination_publish');
     expect(libSource).toContain('forget_nine_router_secrets()?');
     expect(libSource).toContain('nine_router_creds::forget_all');
-    expect(libSource).toContain('persist_credentials');
+    expect(libSource).toContain('begin_write_ticket');
+    expect(libSource).toContain('persist_if_generation');
   });
 
   // 4º feedback P2: conectar/desconectar no cambia la config, así que se necesita
@@ -38,5 +39,11 @@ describe('9Router disconnect', () => {
   it('login y logout piden refresco explícito del widget', () => {
     expect(libSource).toContain('refresh-now');
     expect(widgetSource).toContain("listen('refresh-now'");
+  });
+
+  // 6º feedback P2: set_secret no puede mutar claves de 9Router fuera del coordinador.
+  it('rechaza las claves internas de 9Router en set_secret', () => {
+    expect(libSource).toContain('is_managed_key');
+    expect(libSource).toMatch(/set_secret[\s\S]*is_managed_key/);
   });
 });

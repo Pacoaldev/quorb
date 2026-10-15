@@ -233,6 +233,11 @@ fn secret_status(state: State<'_, AppState>) -> BTreeMap<String, bool> {
 
 #[tauri::command]
 fn set_secret(app: AppHandle, key: String, value: String) -> Result<(), String> {
+    // P2: las claves de 9Router solo mutan vía el coordinador (login/logout/save URL).
+    // El setter genérico saltaría el lock y la generación.
+    if providers::nine_router_creds::is_managed_key(&key) {
+        return Err("Las credenciales de 9Router solo se gestionan al conectar o desconectar.".into());
+    }
     secrets::set(&key, &value)?;
     let _ = app.emit("config-changed", ());
     Ok(())
@@ -281,9 +286,17 @@ async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password:
         .filter(|u| !u.is_empty());
     let base = draft_base.clone().unwrap_or_else(|| saved_base.to_string());
     if providers::nine_router::same_destination(saved_base, draft_base.as_deref()) {
-        // Destino idéntico al persistido: se guarda contraseña, cookie y vínculo.
+        // Ticket antes del await: si hay logout / otro destino / otra conexión,
+        // la respuesta de A no debe restaurar ni sobrescribir (persist_if_generation).
+        let ticket = providers::nine_router_creds::begin_write_ticket();
         let cookie = providers::nine_router::login(&state.http, &base, &password).await?;
-        providers::nine_router::persist_credentials(&base, &password, &cookie)?;
+        match providers::nine_router_creds::persist_if_generation(&base, &password, &cookie, ticket) {
+            Ok(()) => {}
+            Err(providers::nine_router_creds::PersistError::Stale) => {
+                return Err("La sesión de 9Router cambió durante el login. Vuelve a conectar.".into());
+            }
+            Err(providers::nine_router_creds::PersistError::Store(e)) => return Err(e),
+        }
         let _ = app.emit("config-changed", ());
         // P2: la conexión no cambia la config, así que `config-changed` no obliga a
         // refrescar los datos del widget (que se refrescan por `needsRefresh`, que
@@ -837,6 +850,15 @@ mod tests {
         .unwrap();
         assert!(!changed);
         assert!(!forgot);
+    }
+
+    /// P2 (review consolidado): el setter genérico no debe tocar secretos de 9Router.
+    #[test]
+    fn generic_secret_setter_rejects_nine_router_keys() {
+        assert!(providers::nine_router_creds::is_managed_key(secrets::NINE_ROUTER_PASSWORD));
+        assert!(providers::nine_router_creds::is_managed_key(secrets::NINE_ROUTER_SESSION));
+        assert!(providers::nine_router_creds::is_managed_key(secrets::NINE_ROUTER_BOUND_URL));
+        assert!(!providers::nine_router_creds::is_managed_key(secrets::NAN_API_KEY));
     }
 
     /// Carpeta temporal propia de cada prueba: sin dependencias nuevas y sin

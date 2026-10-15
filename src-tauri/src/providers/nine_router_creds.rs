@@ -1,15 +1,15 @@
-//! Credenciales de 9Router: lectura coherente (bound + contraseña + cookie) y
-//! mutaciones serializadas con generación, para que un fetch/probe contra A no
-//! pueda leer o restaurar secretos de B tras un guardado/conexión/logout concurrente.
+//! Credenciales de 9Router: snapshot coherente + mutaciones serializadas con
+//! generación. Toda escritura (login explícito, renovación, logout) pasa por aquí
+//! y falla cerrado: nunca deja secretos utilizables bajo un destino ajeno.
 
 use crate::secrets;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Normaliza una Base URL de 9Router para comparar destinos (trim + sin `/` final).
 pub fn normalize_base(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 static LOCK: Mutex<()> = Mutex::new(());
 static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -30,14 +30,20 @@ pub enum PersistError {
     Store(String),
 }
 
-fn read_snapshot_locked() -> Snapshot {
-    Snapshot {
-        generation: GENERATION.load(Ordering::SeqCst),
-        bound: secrets::get(secrets::NINE_ROUTER_BOUND_URL)
-            .map(|s| normalize_base(&s))
-            .filter(|s| !s.is_empty()),
-        password: non_empty(secrets::get(secrets::NINE_ROUTER_PASSWORD)),
-        session: non_empty(secrets::get(secrets::NINE_ROUTER_SESSION)),
+/// Almacén de los tres secretos. Producción usa Credential Manager; tests un fake.
+pub trait CredStore {
+    fn get(&self, key: &str) -> Option<String>;
+    fn set(&mut self, key: &str, value: &str) -> Result<(), String>;
+}
+
+struct KeyringStore;
+
+impl CredStore for KeyringStore {
+    fn get(&self, key: &str) -> Option<String> {
+        secrets::get(key)
+    }
+    fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        secrets::set(key, value)
     }
 }
 
@@ -45,10 +51,20 @@ fn non_empty(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
 }
 
-/// Snapshot solo si el vínculo coincide con `base` (trim + sin `/` final).
-pub fn snapshot_for_base(base: &str) -> Option<Snapshot> {
-    let _g = LOCK.lock().unwrap();
-    let snap = read_snapshot_locked();
+fn read_snapshot(store: &impl CredStore, generation: u64) -> Snapshot {
+    Snapshot {
+        generation,
+        bound: store
+            .get(secrets::NINE_ROUTER_BOUND_URL)
+            .map(|s| normalize_base(&s))
+            .filter(|s| !s.is_empty()),
+        password: non_empty(store.get(secrets::NINE_ROUTER_PASSWORD)),
+        session: non_empty(store.get(secrets::NINE_ROUTER_SESSION)),
+    }
+}
+
+fn snapshot_matching(store: &impl CredStore, generation: u64, base: &str) -> Option<Snapshot> {
+    let snap = read_snapshot(store, generation);
     let want = normalize_base(base);
     if snap.bound.as_deref() != Some(&want) {
         return None;
@@ -56,18 +72,42 @@ pub fn snapshot_for_base(base: &str) -> Option<Snapshot> {
     Some(snap)
 }
 
-/// Contraseña guardada para `base` y la generación vigente al leer (para validar tras `.await`).
-pub fn password_ticket_for_base(base: &str) -> Option<(u64, String)> {
-    snapshot_for_base(base).and_then(|s| s.password.map(|p| (s.generation, p)))
+/// Protocolo fail-closed compartido por producción y tests:
+/// 1) invalidar el vínculo (sin él ningún snapshot autentica);
+/// 2) escribir contraseña y cookie;
+/// 3) publicar el vínculo (commit).
+/// Si cualquier paso falla, se deja el vínculo vacío y se intenta limpiar
+/// password/session. Secretos huérfanos sin bound no son utilizables.
+fn write_bundle_fail_closed(store: &mut impl CredStore, base: &str, password: &str, cookie: &str) -> Result<(), String> {
+    let normalized = normalize_base(base);
+    // Invalidación primero: si no se puede, no se toca el resto (estado previo coherente).
+    store.set(secrets::NINE_ROUTER_BOUND_URL, "")?;
+
+    if let Err(e) = store.set(secrets::NINE_ROUTER_PASSWORD, password) {
+        let _ = store.set(secrets::NINE_ROUTER_SESSION, "");
+        let _ = store.set(secrets::NINE_ROUTER_PASSWORD, "");
+        return Err(e);
+    }
+    if let Err(e) = store.set(secrets::NINE_ROUTER_SESSION, cookie) {
+        let _ = store.set(secrets::NINE_ROUTER_PASSWORD, "");
+        let _ = store.set(secrets::NINE_ROUTER_SESSION, "");
+        // bound ya vacío → no utilizable aunque falle la limpieza
+        return Err(e);
+    }
+    if let Err(e) = store.set(secrets::NINE_ROUTER_BOUND_URL, &normalized) {
+        let _ = store.set(secrets::NINE_ROUTER_PASSWORD, "");
+        let _ = store.set(secrets::NINE_ROUTER_SESSION, "");
+        // bound queda vacío (o el set falló al escribir el nuevo; el clear ya pasó)
+        let _ = store.set(secrets::NINE_ROUTER_BOUND_URL, "");
+        return Err(e);
+    }
+    Ok(())
 }
 
-/// Borra los tres secretos; invalida renovaciones pendientes (sube generación primero).
-pub fn forget_all() -> Result<(), String> {
-    let _g = LOCK.lock().unwrap();
-    GENERATION.fetch_add(1, Ordering::SeqCst);
-    let pass = secrets::set(secrets::NINE_ROUTER_PASSWORD, "");
-    let sess = secrets::set(secrets::NINE_ROUTER_SESSION, "");
-    let bound = secrets::set(secrets::NINE_ROUTER_BOUND_URL, "");
+fn forget_bundle(store: &mut impl CredStore) -> Result<(), String> {
+    let pass = store.set(secrets::NINE_ROUTER_PASSWORD, "");
+    let sess = store.set(secrets::NINE_ROUTER_SESSION, "");
+    let bound = store.set(secrets::NINE_ROUTER_BOUND_URL, "");
     match (pass, sess, bound) {
         (Ok(()), Ok(()), Ok(())) => Ok(()),
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
@@ -76,97 +116,140 @@ pub fn forget_all() -> Result<(), String> {
     }
 }
 
-/// Persiste los tres secretos como un solo paso (login explícito / conexión).
-pub fn persist_all(base: &str, password: &str, cookie: &str) -> Result<(), String> {
-    let _g = LOCK.lock().unwrap();
-    write_bundle(base, password, cookie)?;
-    GENERATION.fetch_add(1, Ordering::SeqCst);
-    Ok(())
-}
-
-/// Tras un login en red, solo escribe si la generación no cambió (logout / otro destino).
-pub fn persist_if_generation(base: &str, password: &str, cookie: &str, generation: u64) -> Result<(), PersistError> {
-    let _g = LOCK.lock().unwrap();
-    if GENERATION.load(Ordering::SeqCst) != generation {
+fn persist_if_gen(
+    store: &mut impl CredStore,
+    generation: &mut u64,
+    base: &str,
+    password: &str,
+    cookie: &str,
+    expected: u64,
+) -> Result<(), PersistError> {
+    if *generation != expected {
         return Err(PersistError::Stale);
     }
-    write_bundle(base, password, cookie).map_err(PersistError::Store)?;
+    write_bundle_fail_closed(store, base, password, cookie).map_err(PersistError::Store)?;
+    *generation = generation.wrapping_add(1);
+    Ok(())
+}
+
+/// ¿Clave gestionada solo por el coordinador de 9Router? (también con sufijo `@cuenta`).
+pub fn is_managed_key(key: &str) -> bool {
+    let base = key.split_once('@').map(|(b, _)| b).unwrap_or(key);
+    matches!(
+        base,
+        secrets::NINE_ROUTER_PASSWORD | secrets::NINE_ROUTER_SESSION | secrets::NINE_ROUTER_BOUND_URL
+    )
+}
+
+/// Snapshot solo si el vínculo coincide con `base`.
+pub fn snapshot_for_base(base: &str) -> Option<Snapshot> {
+    let _g = LOCK.lock().unwrap();
+    snapshot_matching(&KeyringStore, GENERATION.load(Ordering::SeqCst), base)
+}
+
+/// Contraseña + generación vigentes para `base` (renovación automática).
+pub fn password_ticket_for_base(base: &str) -> Option<(u64, String)> {
+    snapshot_for_base(base).and_then(|s| s.password.map(|p| (s.generation, p)))
+}
+
+/// Generación actual bajo el lock: ticket para login explícito antes del `.await`.
+pub fn begin_write_ticket() -> u64 {
+    let _g = LOCK.lock().unwrap();
+    GENERATION.load(Ordering::SeqCst)
+}
+
+/// Borra los tres secretos; sube generación primero (invalida respuestas pendientes).
+pub fn forget_all() -> Result<(), String> {
+    let _g = LOCK.lock().unwrap();
     GENERATION.fetch_add(1, Ordering::SeqCst);
-    Ok(())
+    forget_bundle(&mut KeyringStore)
 }
 
-fn write_bundle(base: &str, password: &str, cookie: &str) -> Result<(), String> {
-    let normalized = normalize_base(base);
-    secrets::set(secrets::NINE_ROUTER_PASSWORD, password)?;
-    if let Err(e) = secrets::set(secrets::NINE_ROUTER_SESSION, cookie) {
-        let _ = secrets::set(secrets::NINE_ROUTER_PASSWORD, "");
-        return Err(e);
+/// Persiste solo si la generación no cambió (login explícito / renovación tras red).
+pub fn persist_if_generation(base: &str, password: &str, cookie: &str, generation: u64) -> Result<(), PersistError> {
+    let _g = LOCK.lock().unwrap();
+    let mut gen = GENERATION.load(Ordering::SeqCst);
+    let result = persist_if_gen(&mut KeyringStore, &mut gen, base, password, cookie, generation);
+    if result.is_ok() {
+        GENERATION.store(gen, Ordering::SeqCst);
     }
-    if let Err(e) = secrets::set(secrets::NINE_ROUTER_BOUND_URL, &normalized) {
-        let _ = secrets::set(secrets::NINE_ROUTER_PASSWORD, "");
-        let _ = secrets::set(secrets::NINE_ROUTER_SESSION, "");
-        return Err(e);
+    result
+}
+
+// ── Fake inyectable (tests): misma write_bundle_fail_closed que producción ───
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct FakeStore {
+    values: std::collections::BTreeMap<String, String>,
+    /// Clave cuyo próximo `set` no vacío falla.
+    fail_set: Option<String>,
+    /// `set` a vacío de esta clave también falla (limpieza rota).
+    fail_clear_key: Option<String>,
+}
+
+#[cfg(test)]
+impl CredStore for FakeStore {
+    fn get(&self, key: &str) -> Option<String> {
+        self.values.get(key).cloned().filter(|s| !s.trim().is_empty())
     }
-    Ok(())
-}
-
-// ── Lógica pura (misma semántica que arriba) para regresiones de interleaving ──
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MemStore {
-    pub generation: u64,
-    pub bound: Option<String>,
-    pub password: Option<String>,
-    pub session: Option<String>,
-}
-
-impl MemStore {
-    pub fn snapshot_for_base(&self, base: &str) -> Option<Snapshot> {
-        let want = normalize_base(base);
-        if self.bound.as_deref() != Some(&want) {
-            return None;
+    fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let empty = value.trim().is_empty();
+        if empty {
+            if self.fail_clear_key.as_deref() == Some(key) {
+                return Err(format!("clear failed: {key}"));
+            }
+        } else if self.fail_set.as_deref() == Some(key) {
+            return Err(format!("set failed: {key}"));
         }
-        Some(Snapshot {
-            generation: self.generation,
-            bound: self.bound.clone(),
-            password: self.password.clone(),
-            session: self.session.clone(),
-        })
-    }
-
-    pub fn forget(&mut self) {
-        self.generation += 1;
-        self.bound = None;
-        self.password = None;
-        self.session = None;
-    }
-
-    pub fn persist_all(&mut self, base: &str, password: &str, cookie: &str) {
-        self.bound = Some(normalize_base(base));
-        self.password = Some(password.to_string());
-        self.session = Some(cookie.to_string());
-        self.generation += 1;
-    }
-
-    pub fn persist_if_generation(&mut self, base: &str, password: &str, cookie: &str, generation: u64) -> Result<(), PersistError> {
-        if self.generation != generation {
-            return Err(PersistError::Stale);
+        if empty {
+            self.values.remove(key);
+        } else {
+            self.values.insert(key.to_string(), value.trim().to_string());
         }
-        self.persist_all(base, password, cookie);
         Ok(())
     }
+}
 
-    /// Misma semántica que `write_bundle` en producción: si falla la cookie, revierte la contraseña.
-    pub fn write_bundle(&mut self, base: &str, password: &str, cookie: &str, fail_session: bool) -> Result<(), String> {
-        let prev_password = self.password.clone();
-        self.password = Some(password.to_string());
-        if fail_session {
-            self.password = prev_password;
-            return Err("session write failed".into());
-        }
-        self.session = Some(cookie.to_string());
-        self.bound = Some(normalize_base(base));
-        Ok(())
+#[cfg(test)]
+impl FakeStore {
+    fn seed(bound: &str, password: &str, session: &str) -> Self {
+        let mut s = Self::default();
+        s.values.insert(secrets::NINE_ROUTER_BOUND_URL.into(), normalize_base(bound));
+        s.values.insert(secrets::NINE_ROUTER_PASSWORD.into(), password.into());
+        s.values.insert(secrets::NINE_ROUTER_SESSION.into(), session.into());
+        s
+    }
+}
+
+/// Gestor de prueba: misma lógica que los wrappers globales, con almacén inyectado.
+#[cfg(test)]
+struct CredsCore<S> {
+    store: S,
+    generation: u64,
+}
+
+#[cfg(test)]
+impl<S: CredStore> CredsCore<S> {
+    fn snapshot_for_base(&self, base: &str) -> Option<Snapshot> {
+        snapshot_matching(&self.store, self.generation, base)
+    }
+
+    fn begin_write_ticket(&self) -> u64 {
+        self.generation
+    }
+
+    fn forget_all(&mut self) -> Result<(), String> {
+        self.generation = self.generation.wrapping_add(1);
+        forget_bundle(&mut self.store)
+    }
+
+    fn persist_if_generation(&mut self, base: &str, password: &str, cookie: &str, expected: u64) -> Result<(), PersistError> {
+        persist_if_gen(&mut self.store, &mut self.generation, base, password, cookie, expected)
+    }
+
+    fn write_bundle(&mut self, base: &str, password: &str, cookie: &str) -> Result<(), String> {
+        write_bundle_fail_closed(&mut self.store, base, password, cookie)
     }
 }
 
@@ -174,79 +257,134 @@ impl MemStore {
 mod tests {
     use super::*;
 
-    /// P1: validar A y leer cookie en un solo snapshot; tras conectar B, A ya no ve la cookie de B.
-    #[test]
-    fn validate_a_then_connect_b_does_not_leak_b_session_to_a() {
-        let mut store = MemStore {
+    fn core_a() -> CredsCore<FakeStore> {
+        CredsCore {
+            store: FakeStore::seed("http://a", "pa", "cookie-a"),
             generation: 1,
-            bound: Some("http://a".into()),
-            password: Some("pa".into()),
-            session: Some("cookie-a".into()),
-        };
-        let snap_a = store.snapshot_for_base("http://a").expect("bound to A");
+        }
+    }
+
+    #[test]
+    fn snapshot_a_then_connect_b_never_exposes_b_secrets_on_a() {
+        let mut c = core_a();
+        let snap_a = c.snapshot_for_base("http://a").unwrap();
         assert_eq!(snap_a.session.as_deref(), Some("cookie-a"));
 
-        store.persist_all("http://b", "pb", "cookie-b");
+        let ticket = c.begin_write_ticket();
+        c.persist_if_generation("http://b", "pb", "cookie-b", ticket).unwrap();
 
-        assert!(store.snapshot_for_base("http://a").is_none());
-        let snap_b = store.snapshot_for_base("http://b").unwrap();
-        assert_eq!(snap_b.session.as_deref(), Some("cookie-b"));
-        // El fetch A que tenía snap_a no debe re-leer: la cookie queda en snap_a (vieja), pero
-        // un nuevo snapshot_for_base(A) no devuelve cookie-b.
+        assert!(c.snapshot_for_base("http://a").is_none());
+        assert_eq!(c.snapshot_for_base("http://b").unwrap().session.as_deref(), Some("cookie-b"));
         assert_ne!(snap_a.session.as_deref(), Some("cookie-b"));
     }
 
-    /// P1: renovación A pendiente → conectar B no debe restaurar credenciales A.
     #[test]
-    fn pending_renewal_a_aborted_when_b_connects() {
-        let mut store = MemStore {
-            generation: 2,
-            bound: Some("http://a".into()),
-            password: Some("pa".into()),
-            session: Some("old-a".into()),
-        };
-        let gen_at_start = store.generation;
-        // await login en A…
-        store.persist_all("http://b", "pb", "cookie-b");
+    fn pending_auto_renewal_a_discarded_after_connect_b() {
+        let mut c = core_a();
+        let ticket = c.begin_write_ticket();
+        c.persist_if_generation("http://b", "pb", "cookie-b", ticket).unwrap();
         assert_eq!(
-            store.persist_if_generation("http://a", "pa", "new-a", gen_at_start),
+            c.persist_if_generation("http://a", "pa", "new-a", ticket),
             Err(PersistError::Stale)
         );
-        assert_eq!(store.bound.as_deref(), Some("http://b"));
-        assert_eq!(store.session.as_deref(), Some("cookie-b"));
+        assert_eq!(c.snapshot_for_base("http://b").unwrap().session.as_deref(), Some("cookie-b"));
     }
 
-    /// P1: renovación pendiente → logout descarta la respuesta antigua.
     #[test]
-    fn pending_renewal_discarded_after_logout() {
-        let mut store = MemStore {
-            generation: 3,
-            bound: Some("http://a".into()),
-            password: Some("pa".into()),
-            session: None,
-        };
-        let gen_at_start = store.generation;
-        store.forget();
+    fn pending_auto_renewal_discarded_after_logout() {
+        let mut c = core_a();
+        let ticket = c.begin_write_ticket();
+        c.forget_all().unwrap();
         assert_eq!(
-            store.persist_if_generation("http://a", "pa", "cookie-a", gen_at_start),
+            c.persist_if_generation("http://a", "pa", "cookie-a", ticket),
             Err(PersistError::Stale)
         );
-        assert!(store.bound.is_none());
+        assert!(c.snapshot_for_base("http://a").is_none());
     }
 
-    /// P1: fallo al escribir la cookie no deja contraseña huérfana ni cambia bound previo.
     #[test]
-    fn partial_write_rolls_back_password_when_session_fails() {
-        let mut store = MemStore {
+    fn explicit_login_a_pending_then_logout_discards_response() {
+        let mut c = core_a();
+        let ticket = c.begin_write_ticket();
+        // await login A…
+        c.forget_all().unwrap();
+        assert_eq!(
+            c.persist_if_generation("http://a", "pa", "fresh-a", ticket),
+            Err(PersistError::Stale)
+        );
+    }
+
+    #[test]
+    fn explicit_login_a_pending_then_connect_b_keeps_b() {
+        let mut c = CredsCore {
+            store: FakeStore::default(),
             generation: 0,
-            bound: Some("http://b".into()),
-            password: Some("pb".into()),
-            session: Some("cookie-b".into()),
         };
-        let before = store.clone();
-        assert!(store.write_bundle("http://a", "pa", "cookie-a", true).is_err());
-        assert_eq!(store.bound, before.bound);
-        assert_eq!(store.session, before.session);
-        assert_eq!(store.password, before.password);
+        let ticket_a = c.begin_write_ticket();
+        // await A… meanwhile B connects
+        let ticket_b = c.begin_write_ticket();
+        c.persist_if_generation("http://b", "pb", "cookie-b", ticket_b).unwrap();
+        assert_eq!(
+            c.persist_if_generation("http://a", "pa", "cookie-a", ticket_a),
+            Err(PersistError::Stale)
+        );
+        assert_eq!(c.snapshot_for_base("http://b").unwrap().password.as_deref(), Some("pb"));
+        assert!(c.snapshot_for_base("http://a").is_none());
+    }
+
+    #[test]
+    fn older_pending_login_does_not_replace_newer_connection() {
+        let mut c = CredsCore {
+            store: FakeStore::default(),
+            generation: 5,
+        };
+        let old = c.begin_write_ticket();
+        let newer = c.begin_write_ticket();
+        c.persist_if_generation("http://b", "pb", "cookie-b", newer).unwrap();
+        assert_eq!(
+            c.persist_if_generation("http://a", "pa", "cookie-a", old),
+            Err(PersistError::Stale)
+        );
+        assert_eq!(c.snapshot_for_base("http://b").unwrap().session.as_deref(), Some("cookie-b"));
+    }
+
+    #[test]
+    fn bound_write_fail_and_session_clear_fail_leaves_secrets_unusable() {
+        // B coherente → publicar A: clear bound OK, password/session OK, commit bound falla
+        // y limpiar la cookie también falla. Bound vacío ⇒ ningún snapshot autentica.
+        let mut c = CredsCore {
+            store: FakeStore::seed("http://b", "pb", "cookie-b"),
+            generation: 1,
+        };
+        c.store.fail_set = Some(secrets::NINE_ROUTER_BOUND_URL.into());
+        c.store.fail_clear_key = Some(secrets::NINE_ROUTER_SESSION.into());
+        assert!(c.write_bundle("http://a", "pa", "cookie-a").is_err());
+        assert!(c.snapshot_for_base("http://a").is_none());
+        assert!(c.snapshot_for_base("http://b").is_none());
+        assert!(c.store.get(secrets::NINE_ROUTER_BOUND_URL).is_none());
+    }
+
+    #[test]
+    fn session_write_fail_and_password_clear_fail_leaves_unusable() {
+        let mut c = CredsCore {
+            store: FakeStore::seed("http://b", "pb", "cookie-b"),
+            generation: 1,
+        };
+        c.store.fail_set = Some(secrets::NINE_ROUTER_SESSION.into());
+        c.store.fail_clear_key = Some(secrets::NINE_ROUTER_PASSWORD.into());
+        assert!(c.write_bundle("http://a", "pa", "cookie-a").is_err());
+        assert!(c.snapshot_for_base("http://a").is_none());
+        assert!(c.snapshot_for_base("http://b").is_none());
+        assert!(c.store.get(secrets::NINE_ROUTER_BOUND_URL).is_none());
+    }
+
+    #[test]
+    fn managed_keys_detected_for_generic_setter() {
+        assert!(is_managed_key(secrets::NINE_ROUTER_PASSWORD));
+        assert!(is_managed_key(secrets::NINE_ROUTER_SESSION));
+        assert!(is_managed_key(secrets::NINE_ROUTER_BOUND_URL));
+        assert!(is_managed_key("nine_router_password@nine_router:x"));
+        assert!(!is_managed_key(secrets::NAN_API_KEY));
+        assert!(!is_managed_key("openrouter_api_key"));
     }
 }

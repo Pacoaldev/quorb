@@ -47,7 +47,6 @@ pub fn same_destination(saved: &str, draft: Option<&str>) -> bool {
     }
 }
 
-pub use super::nine_router_creds::persist_all as persist_credentials;
 
 /// Inicia sesión en el dashboard local y devuelve la cabecera `Cookie` resultante.
 /// `POST /api/auth/login { "password": … }` → `Set-Cookie: auth_token=…`.
