@@ -2,6 +2,7 @@ mod channel;
 mod cli_process;
 mod codex_setup;
 mod config;
+mod config_transaction;
 mod history;
 mod login;
 mod model;
@@ -143,34 +144,34 @@ fn get_config(state: State<'_, AppState>) -> AppConfig {
 
 /// Sustituye la config bajo el lock y la persiste en el mismo paso, para que
 /// `save_config` y `patch_config` no se pisen a medias (merge atómico).
-/// Devuelve (anterior, nueva). Los efectos secundarios van fuera del lock.
+/// Devuelve (anterior, nueva). La invalidación de credenciales y la publicación
+/// comparten el lock; los efectos de UI se aplican después de soltarlo.
 fn update_config(
     state: &AppState,
     mutate: impl FnOnce(&mut AppConfig),
 ) -> Result<(AppConfig, AppConfig), String> {
-    let mut guard = state.config.lock().unwrap();
-    let mut next = guard.clone();
-    mutate(&mut next);
-    let next = next.sanitized();
-    config::save(&state.config_path, &next)?;
-    let old = std::mem::replace(&mut *guard, next.clone());
-    Ok((old, next))
+    config_transaction::update(
+        &state.config,
+        |current| {
+            let mut next = current.clone();
+            mutate(&mut next);
+            next.sanitized()
+        },
+        |old, next| {
+            invalidate_nine_router_before_destination_publish(
+                &old.nine_router.base_url,
+                &next.nine_router.base_url,
+                forget_nine_router_secrets,
+            ).map(|_| ())
+        },
+        |next| config::save(&state.config_path, next),
+    )
 }
 
 #[tauri::command]
 fn save_config(app: AppHandle, state: State<'_, AppState>, config: AppConfig) -> Result<AppConfig, String> {
-    // P1 (5º feedback): si el destino de 9Router cambia, hay que confirmar el
-    // borrado de secretos *antes* de publicar la URL nueva. Publicar B y borrar
-    // después deja una ventana (y un fallo silencioso del almacén) donde un
-    // refresco concurrente lee B con credenciales de A.
-    let old_base = state.config.lock().unwrap().nine_router.base_url.clone();
-    invalidate_nine_router_before_destination_publish(
-        old_base.trim(),
-        config.nine_router.base_url.trim(),
-        forget_nine_router_secrets,
-    )?;
-
     let (old, config) = update_config(&state, |current| *current = config)?;
+    // La invalidación de 9Router ya ocurrió dentro de la transacción de config.
     // Las cuentas eliminadas se llevan sus secretos del almacén del sistema.
     for gone in old.accounts.iter().filter(|a| !config.accounts.iter().any(|b| b.id == a.id)) {
         secrets::forget_account(gone);
@@ -269,17 +270,16 @@ async fn nan_probe(state: State<'_, AppState>) -> Result<String, String> {
 /// stats en crudo (Ajustes › 9Router › Probar). `base_url` es la del borrador de
 /// Ajustes si el usuario la cambió sin guardar; si no, la persistida.
 ///
-/// Las credenciales (contraseña y cookie) son del servidor, no van asociadas a
-/// una URL en el almacén: por eso, si el borrador apunta a **otro** destino que
-/// el persistido, la prueba se hace con una **sesión temporal aislada** y no se
-/// guarda nada. Guardar la contraseña/cookie de B en los secretos globales sin
-/// actualizar la URL persistida de A (el borrador se puede descartar) dejaría a A
-/// autenticándose con credenciales de B: rompía la conexión anterior y enviaba
-/// las credenciales a un destino distinto. Solo se persiste cuando el destino
-/// probado coincide con el persistido.
+/// Las credenciales están vinculadas al servidor. Una prueba contra otro destino
+/// usa una sesión temporal aislada. Para persistir, config y ticket se capturan
+/// bajo el mismo lock que el guardado y logout; tras la red la generación debe
+/// seguir vigente. Ningún lock de configuración se mantiene durante el `.await`.
 #[tauri::command]
 async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password: String, base_url: Option<String>) -> Result<String, String> {
-    let cfg = state.config.lock().unwrap().clone();
+    let (cfg, ticket) = config_transaction::snapshot_with_ticket(
+        &state.config,
+        providers::nine_router_creds::begin_write_ticket,
+    );
     let saved_base = cfg.nine_router.base_url.trim();
     let draft_base = base_url
         .map(|u| u.trim().to_string())
@@ -288,7 +288,6 @@ async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password:
     if providers::nine_router::same_destination(saved_base, draft_base.as_deref()) {
         // Ticket antes del await: si hay logout / otro destino / otra conexión,
         // la respuesta de A no debe restaurar ni sobrescribir (persist_if_generation).
-        let ticket = providers::nine_router_creds::begin_write_ticket();
         let cookie = providers::nine_router::login(&state.http, &base, &password).await?;
         match providers::nine_router_creds::persist_if_generation(&base, &password, &cookie, ticket) {
             Ok(()) => {}
@@ -313,8 +312,8 @@ async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password:
 /// Desconecta 9Router: borra contraseña, cookie y vínculo al destino.
 /// Si el almacén no confirma el borrado, se propaga el error (no se informa éxito).
 #[tauri::command]
-fn nine_router_logout(app: AppHandle) -> Result<(), String> {
-    forget_nine_router_secrets()?;
+fn nine_router_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    config_transaction::with_locked(&state.config, forget_nine_router_secrets)?;
     let _ = app.emit("config-changed", ());
     // P2: desconectar también debe refrescar el widget al instante (misma razón
     // que en el login: la config no cambia, solo la sesión).
