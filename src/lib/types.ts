@@ -185,7 +185,8 @@ export type SecretKey =
   | 'github_token'
   | 'cursor_token'
   | 'nine_router_password'
-  | 'nine_router_session';
+  | 'nine_router_session'
+  | 'nine_router_bound_url';
 /** Secreto de la cuenta principal o de una adicional (`<secreto>@<id de cuenta>`) */
 export type ScopedSecretKey = SecretKey | `${SecretKey}@${string}`;
 export type SecretStatus = Partial<Record<ScopedSecretKey, boolean>>;
