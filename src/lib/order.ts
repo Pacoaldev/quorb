@@ -36,5 +36,21 @@ export const OFFICIAL_USAGE_URL: Record<string, string> = {
   openrouter: 'https://openrouter.ai/activity',
 };
 
-/** URL de uso oficial de un informe; normaliza el id para las cuentas adicionales (`openrouter:abc`). */
-export const officialUsageUrl = (reportId: string): string | undefined => OFFICIAL_USAGE_URL[providerOf(reportId)];
+/** URL del dashboard de 9Router a partir de su Base URL configurada (sin barra final). */
+export const nineRouterDashboardUrl = (baseUrl: string): string =>
+  `${baseUrl.trim().replace(/\/+$/, '')}/dashboard`;
+
+/**
+ * URL de uso oficial de un informe; normaliza el id para las cuentas adicionales
+ * (`openrouter:abc`). 9Router no tiene una URL fija: su dashboard vive en la Base
+ * URL configurada, así que se compone con `nineRouterBaseUrl` (si no se pasa, no
+ * hay enlace). Antes abría siempre `localhost:20128`, llevando a otra instancia o
+ * fallando cuando se personalizaba el host o el puerto.
+ */
+export const officialUsageUrl = (reportId: string, nineRouterBaseUrl?: string): string | undefined => {
+  const provider = providerOf(reportId);
+  if (provider === 'nine_router') {
+    return nineRouterBaseUrl ? nineRouterDashboardUrl(nineRouterBaseUrl) : undefined;
+  }
+  return OFFICIAL_USAGE_URL[provider];
+};
