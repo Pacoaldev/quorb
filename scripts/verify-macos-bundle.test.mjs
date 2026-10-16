@@ -22,10 +22,11 @@ function fixture() {
   header.writeUInt32LE(0x0100000c, 4);
   header.writeUInt32LE(2, 12);
   file(path.join(root, 'package.json'), JSON.stringify({ version: '0.6.0' }));
+  file(path.join(root, 'src-tauri', 'tauri.macos.conf.json'), JSON.stringify({ bundle: { macOS: { minimumSystemVersion: '15.0' } } }));
   file(path.join(app, 'Contents', 'Info.plist'), 'plist');
   file(path.join(app, 'Contents', 'MacOS', 'quorb'), header);
   file(dmg, Buffer.from('disk image'));
-  const plist = { CFBundleShortVersionString: '0.6.0', CFBundleIdentifier: 'es.egdev.quorb', CFBundleExecutable: 'quorb' };
+  const plist = { CFBundleShortVersionString: '0.6.0', CFBundleIdentifier: 'es.egdev.quorb', CFBundleExecutable: 'quorb', LSMinimumSystemVersion: '15.0' };
   const calls = [];
   const io = {
     lstatSync(name) {
@@ -52,11 +53,38 @@ test('verifies native bundle metadata, DMG integrity and source-linked digest wi
   assert.equal(report.sourceSha, sourceSha);
   assert.equal(report.arch, 'arm64');
   assert.equal(report.version, '0.6.0');
+  assert.equal(report.minimumSystemVersion, '15.0');
   assert.equal(report.dmgSha256, createHash('sha256').update('disk image').digest('hex'));
   assert.deepEqual(f.calls, [
     ['/usr/bin/plutil', ['-convert', 'json', '-o', '-', path.join(app, 'Contents', 'Info.plist')]],
     ['/usr/bin/hdiutil', ['verify', dmg]],
   ]);
+});
+
+test('rejects missing, older or incorrect minimum macOS metadata and config', () => {
+  for (const value of [undefined, '12.0', '14.0', '15', '16.0', 15, '15.0\n']) {
+    const f = fixture();
+    f.plist.LSMinimumSystemVersion = value;
+    assert.throws(() => f.verify(), /minimum macOS/);
+    const config = fixture();
+    config.files.get(path.join(root, 'src-tauri', 'tauri.macos.conf.json')).data =
+      JSON.stringify({ bundle: { macOS: { minimumSystemVersion: value } } });
+    assert.throws(() => config.verify(), /minimum macOS/);
+  }
+});
+
+test('rejects malformed minimum macOS configuration', () => {
+  for (const data of ['{', 'null', '{}', '{"bundle":null}']) {
+    const f = fixture();
+    f.files.get(path.join(root, 'src-tauri', 'tauri.macos.conf.json')).data = data;
+    assert.throws(() => f.verify(), /JSON|minimum macOS/);
+  }
+});
+
+test('macOS config declares the minimum build target using the Tauri 2 field name', async () => {
+  const { readFileSync } = await import('node:fs');
+  const config = JSON.parse(readFileSync(new URL('../src-tauri/tauri.macos.conf.json', import.meta.url), 'utf8'));
+  assert.equal(config.bundle.macOS?.minimumSystemVersion, '15.0');
 });
 
 test('rejects mismatched metadata and unsafe executable names', () => {

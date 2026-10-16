@@ -7,6 +7,14 @@ import { createHash } from 'node:crypto';
 const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 const execute = (command, args) => execFileSync(command, args, { encoding: 'utf8', timeout: 120_000 });
 
+function parseMetadata(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('Invalid bundle metadata JSON');
+  }
+}
+
 export function verifyMacosBundle({ root = projectRoot, sourceSha = process.env.GITHUB_SHA, io = fs, run = execute } = {}) {
   if (!/^[a-fA-F0-9]{40}$/.test(sourceSha ?? '')) throw new Error('Invalid source SHA (40 hex required)');
   root = path.resolve(root);
@@ -41,10 +49,15 @@ export function verifyMacosBundle({ root = projectRoot, sourceSha = process.env.
   discover(bundle);
   if (apps.length !== 1 || dmgs.length !== 1) throw new Error('Expected exactly one .app and one .dmg');
   const plistPath = checked(path.join(apps[0], 'Contents/Info.plist'), 'file');
-  const plist = JSON.parse(run('/usr/bin/plutil', ['-convert', 'json', '-o', '-', plistPath]));
-  const pkg = JSON.parse(io.readFileSync(checked(path.join(root, 'package.json'), 'file'), 'utf8'));
+  const plist = parseMetadata(run('/usr/bin/plutil', ['-convert', 'json', '-o', '-', plistPath]));
+  const pkg = parseMetadata(io.readFileSync(checked(path.join(root, 'package.json'), 'file'), 'utf8'));
   if (typeof pkg.version !== 'string' || plist.CFBundleShortVersionString !== pkg.version) throw new Error('Bundle version mismatch');
   if (plist.CFBundleIdentifier !== 'es.egdev.quorb') throw new Error('Bundle identifier mismatch');
+  const config = parseMetadata(io.readFileSync(checked(path.join(root, 'src-tauri/tauri.macos.conf.json'), 'file'), 'utf8'));
+  const minimumSystemVersion = config?.bundle?.macOS?.minimumSystemVersion;
+  if (minimumSystemVersion !== '15.0' || plist.LSMinimumSystemVersion !== minimumSystemVersion) {
+    throw new Error('Bundle minimum macOS version mismatch (expected 15.0)');
+  }
   const executable = plist.CFBundleExecutable;
   if (typeof executable !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(executable)) throw new Error('Unsafe executable name');
   const binary = io.readFileSync(checked(path.join(apps[0], 'Contents/MacOS', executable), 'file'));
@@ -53,7 +66,7 @@ export function verifyMacosBundle({ root = projectRoot, sourceSha = process.env.
       binary.readUInt32LE(4) !== 0x0100000c || binary.readUInt32LE(12) !== 2) throw new Error('Expected native arm64 Mach-O executable');
   run('/usr/bin/hdiutil', ['verify', dmgs[0]]);
   return {
-    sourceSha, version: pkg.version, arch: 'arm64', app: apps[0], dmg: dmgs[0],
+    sourceSha, version: pkg.version, arch: 'arm64', minimumSystemVersion, app: apps[0], dmg: dmgs[0],
     dmgSha256: createHash('sha256').update(io.readFileSync(dmgs[0])).digest('hex'),
   };
 }

@@ -5,7 +5,7 @@
 El workflow está en `.github/workflows/macos-ci.yml`, materializado desde
 `.github/security-drafts/macos-ci.yml` mediante un plan de bootstrap aprobado.
 Las pruebas exigen igualdad exacta entre esa fuente revisada y el workflow.
-No cambia CI de Windows, Rust, los iconos ni la configuración de Tauri.
+No cambia CI de Windows, Rust ni los iconos.
 
 ## Actualizaciones en macOS
 
@@ -15,6 +15,22 @@ del binario; el plugin updater no se registra y sus permisos solo se conceden en
 Windows/Linux. Windows conserva su updater nativo. Si la política no se puede
 resolver, las acciones quedan bloqueadas hasta reiniciar.
 Esto no publica una preview descargable ni acredita funcionamiento de la GUI.
+
+## Fundamentos de preview: preparatorio, no operativo
+
+La configuración macOS fija `bundle.macOS.minimumSystemVersion` en **15.0**.
+El verificador exige el mismo `LSMinimumSystemVersion` en `Info.plist` y lo reporta.
+Es un objetivo de compilación macOS 15+, no evidencia de instalación ni de GUI; no acredita soporte para macOS 12.
+La biblioteca pura `scripts/macos-preview-policy.mjs` valida datos inyectados de fuente y checks,
+construye un manifiesto determinista unsigned-preview y compara readback y SHA-256 de bytes del DMG.
+Exige main, versión exacta y SHA fuente = workflow = HEAD; solo autoriza los cuatro checks nombrados,
+completos, únicos, exitosos y de GitHub Actions. No verifica todas las protecciones de GitHub.
+El futuro adaptador deberá obtener HEAD real, `github.sha` y la respuesta REST completa antes de registrar procedencia.
+El contrato fija ARM64, actualización manual, sin Developer ID ni notarización y retención de 14 días:
+la retención del artifact/manifiesto no implica que la aplicación expire; el digest del ZIP no es el hash del DMG.
+Pruebas sin red ni GUI: `node --test scripts/macos-preview-policy.test.mjs scripts/verify-macos-bundle.test.mjs scripts/macos-ci.test.mjs`.
+Quedan pendientes workflow de preview, adaptador CLI, uploads y readback real de artifacts descargados.
+Estos fundamentos no publican una preview descargable ni una Release, ni acreditan una preview macOS lista.
 
 ## Ejecución prevista
 
