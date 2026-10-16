@@ -687,6 +687,12 @@ pub fn run() {
             if let Some(w) = app.get_webview_window(WIDGET) {
                 let _ = w.set_always_on_top(cfg.always_on_top);
             }
+            // En macOS una ventana queda clavada en su Space a menos que se marque
+            // «visible en todos los Spaces» (NSWindow.canJoinAllSpaces): sin esto la
+            // tira no sigue al usuario entre Spaces ni sobre apps fullscreen, y el
+            // detalle/overlay quedarían en otro Space distinto al de la tira.
+            // Windows/Linux no lo necesitan: no hay Spaces y siempre-encina ya
+            // cubre el caso.
             let history = history::History::load(data_dir.join("history.json"));
 
             // El detalle tiene su propia superficie: abrirlo nunca redimensiona la tira.
@@ -717,6 +723,17 @@ pub fn run() {
                 .visible(false)
                 .build()?;
             let _ = overlay.set_ignore_cursor_events(true);
+
+            // Se aplica tras construir DETAIL y OVERLAY: si corre antes, esos dos
+            // get_webview_window devuelven None y quedan clavados a su Space.
+            #[cfg(target_os = "macos")]
+            for label in [WIDGET, DETAIL, OVERLAY] {
+                if let Some(w) = app.get_webview_window(label) {
+                    if let Err(e) = w.set_visible_on_all_workspaces(true) {
+                        eprintln!("No pude marcar «{label}» visible en todos los Spaces: {e}");
+                    }
+                }
+            }
 
             app.manage(Shortcuts::default());
             app.manage(codex_setup::CodexSetupState::default());
