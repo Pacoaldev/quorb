@@ -10,7 +10,7 @@ Thanks for taking the time to improve Quorb. Issues and pull requests are welcom
 
 ### Before you start
 
-Quorb currently targets Windows. You need Node 22+, Rust with the MSVC toolchain, Microsoft C++ Build Tools and WebView2. See the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
+Quorb currently targets Windows as its main platform; a Linux port is in progress (local development only, see the README Linux notes). For Windows you need Node 22+, Rust with the MSVC toolchain, Microsoft C++ Build Tools and WebView2. See the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
 
 **Linux contributors**: the native port is tracked under [issue #105](https://github.com/egdev6/quorb/issues/105) and its baseline, support matrix and known limits are documented in [docs/build-linux.md](./docs/build-linux.md). For Linux build and tests, use the included devcontainer (`make up` then `make test`) — it provisions Node 22, Rust stable and the Tauri Linux system dependencies without touching the host. A Linux CI workflow (`.github/workflows/linux-ci.yml`) runs `cargo test --locked`, `npm test`, `npm run app:build`, and AppImage/deb verification on `ubuntu-22.04` runners, gated by tag `v*` or `workflow_dispatch` — it is **not** a PR gate yet (see #108 for the PR-gate follow-up). Do not claim support for a distro or compositor that is not marked as measured in [the matrix](./docs/build-linux.md#6-matriz-de-7-entornos-l0b--qué-funciona-y-qué-degrada).
 
@@ -151,7 +151,7 @@ Gracias por dedicar tiempo a mejorar Quorb. Se aceptan issues y pull requests, e
 
 ### Antes de empezar
 
-Quorb está dirigido actualmente a Windows. Necesitáis Node 22+, Rust con el toolchain MSVC, Microsoft C++ Build Tools y WebView2. Consultad los [requisitos de Tauri](https://v2.tauri.app/start/prerequisites/).
+Quorb está dirigido actualmente a Windows como plataforma principal; hay un port Linux en marcha (solo desarrollo local, ver las notas de Linux del README). Para Windows se necesitan Node 22+, Rust con el toolchain MSVC, Microsoft C++ Build Tools y WebView2. Consultad los [requisitos de Tauri](https://v2.tauri.app/start/prerequisites/).
 
 **Contribuidores de Linux**: el port nativo se sigue en la [issue #105](https://github.com/egdev6/quorb/issues/105) y su baseline, matriz de soporte y límites conocidos están documentados en [docs/build-linux.md](./docs/build-linux.md). Para compilar y testear en Linux, usad el devcontainer incluido (`make up` y luego `make test`) — aprovisiona Node 22, Rust estable y las dependencias de sistema de Tauri sin tocar el host. Existe un workflow de CI Linux (`.github/workflows/linux-ci.yml`) que corre `cargo test --locked`, `npm test`, `npm run app:build` y la verificación de AppImage/deb en runners `ubuntu-22.04`, limitado a tag `v*` o `workflow_dispatch` — **todavía no es gate de PR** (seguimiento en #108). No afirmar soporte de ninguna distro o compositor que no esté marcado como medido en [la matriz](./docs/build-linux.md#6-matriz-de-7-entornos-l0b--qué-funciona-y-qué-degrada).
 

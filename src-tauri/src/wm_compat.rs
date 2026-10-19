@@ -81,10 +81,18 @@ impl Env {
     /// Lee las env vars del proceso y las normaliza (vacía → None).
     pub fn from_process() -> Self {
         Self {
-            wayland_display: std::env::var("WAYLAND_DISPLAY").ok().filter(|s| !s.is_empty()),
-            xdg_session_type: std::env::var("XDG_SESSION_TYPE").ok().filter(|s| !s.is_empty()),
-            desktop_session: std::env::var("DESKTOP_SESSION").ok().filter(|s| !s.is_empty()),
-            xdg_current_desktop: std::env::var("XDG_CURRENT_DESKTOP").ok().filter(|s| !s.is_empty()),
+            wayland_display: std::env::var("WAYLAND_DISPLAY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            xdg_session_type: std::env::var("XDG_SESSION_TYPE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            desktop_session: std::env::var("DESKTOP_SESSION")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            xdg_current_desktop: std::env::var("XDG_CURRENT_DESKTOP")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 }
@@ -109,14 +117,6 @@ pub fn detect_wm_info_from_env(env: &Env) -> WindowManagerInfo {
     // GNOME/KDE cotidianamente corren sobre Xorg: su token en
     // XDG_CURRENT_DESKTOP no debe marcar Wayland. Sway/Hyprland/wlroots y
     // el resto de tokens solo-Wayland no tienen X11, así que sí lo señalan.
-    let is_wayland = env_n.wayland_display.is_some()
-        || env_n.xdg_session_type.as_deref().map(|s| s.eq_ignore_ascii_case("wayland")).unwrap_or(false)
-        || env_n
-            .xdg_current_desktop
-            .as_deref()
-            .map(|s| s.split(':').any(is_wayland_only_session))
-            .unwrap_or(false);
-
     let is_hyprland = env_n
         .desktop_session
         .as_deref()
@@ -128,25 +128,67 @@ pub fn detect_wm_info_from_env(env: &Env) -> WindowManagerInfo {
             .map(|s| s.split(':').any(|p| p.eq_ignore_ascii_case("Hyprland")))
             .unwrap_or(false);
 
-    let recommendation = recommendation(
-        is_wayland,
-        is_hyprland,
-        env_n.desktop_session.as_deref(),
-        env_n.xdg_current_desktop.as_deref(),
-    );
+    // Hyprland es un compositor Wayland-only: si `DESKTOP_SESSION=hyprland` o
+    // `XDG_CURRENT_DESKTOP=Hyprland` sin más señales, el usuario está en
+    // Wayland (no en X11) — `surfaces_for` debe tomar la rama Hyprland, no
+    // la X11. `is_hyprland` se usa como señal adicional de Wayland.
+    let is_wayland = env_n.wayland_display.is_some()
+        || env_n
+            .xdg_session_type
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+        || env_n
+            .xdg_current_desktop
+            .as_deref()
+            .map(|s| s.split(':').any(is_wayland_only_session))
+            .unwrap_or(false)
+        || is_hyprland;
 
     // `env_n` ya clonó los `Option<String>` desde el `&Env` input (y filtró
     // vacíos); se mueven al struct sin clones adicionales.
-    let is_gnome = env_n.desktop_session.as_deref().map(|s| s.eq_ignore_ascii_case("gnome")).unwrap_or(false)
-        || env_n.xdg_current_desktop.as_deref().map(|s| s.split(':').any(|p| p.eq_ignore_ascii_case("GNOME"))).unwrap_or(false);
-    let is_kde = env_n.desktop_session.as_deref().map(|s| {
-        matches!(
-            s.to_ascii_lowercase().as_str(),
-            "kde" | "kde-5" | "kde-6" | "kde-plasma" | "plasma" | "plasma5" | "plasma6" | "kde_x11" | "kde5-19" | "default.desktop"
-        )
-    })
-    .unwrap_or(false)
-        || env_n.xdg_current_desktop.as_deref().map(|s| s.split(':').any(is_kde_token)).unwrap_or(false);
+    let is_gnome = env_n
+        .desktop_session
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("gnome"))
+        .unwrap_or(false)
+        || env_n
+            .xdg_current_desktop
+            .as_deref()
+            .map(|s| s.split(':').any(|p| p.eq_ignore_ascii_case("GNOME")))
+            .unwrap_or(false);
+    let is_kde = env_n
+        .desktop_session
+        .as_deref()
+        .map(|s| {
+            matches!(
+                s.to_ascii_lowercase().as_str(),
+                "kde"
+                    | "kde-5"
+                    | "kde-6"
+                    | "kde-plasma"
+                    | "plasma"
+                    | "plasma5"
+                    | "plasma6"
+                    | "kde_x11"
+                    | "kde5-19"
+                    | "default.desktop"
+            )
+        })
+        .unwrap_or(false)
+        || env_n
+            .xdg_current_desktop
+            .as_deref()
+            .map(|s| s.split(':').any(is_kde_token))
+            .unwrap_or(false);
+
+    let recommendation = recommendation(
+        is_wayland,
+        is_hyprland,
+        is_kde,
+        env_n.desktop_session.as_deref(),
+        env_n.xdg_current_desktop.as_deref(),
+    );
 
     WindowManagerInfo {
         wayland_display: env_n.wayland_display,
@@ -170,14 +212,19 @@ fn is_kde_token(token: &str) -> bool {
 
 /// Límites por superficie derivados de la sesión detectada. Pura y
 /// determinista: los tests fijan lo que Ajustes va a mostrar.
-fn surfaces_for(is_wayland: bool, is_hyprland: bool, is_gnome: bool, is_kde: bool) -> DesktopSurfaces {
+fn surfaces_for(
+    is_wayland: bool,
+    is_hyprland: bool,
+    is_gnome: bool,
+    is_kde: bool,
+) -> DesktopSurfaces {
     if !is_wayland {
         // X11 (la común en la matriz): siempre-encima, click-through, bandeja,
         // atajos y transparencia dependen del compositor de Windows, pero los
         // escritorios evaluados (GNOME, KDE, XFCE) compositan.
         return DesktopSurfaces {
             always_on_top: SurfaceStatus { state: "ok", note: "En X11 la tira se mantiene sobre las demás ventanas." },
-            click_through: SurfaceStatus { state: "ok", note: "El ratón atraviesa los huecos de la tira." },
+            click_through: SurfaceStatus { state: "limited", note: "Click-through del widget no implementado: el ratón no atraviesa la tira; solo el overlay de efectos lo usa." },
             tray_icon: SurfaceStatus { state: "ok", note: "El icono de bandeja se muestra en los gestores que la evalúan." },
             global_shortcuts: SurfaceStatus { state: "ok", note: "Los atajos globales funcionan desde cualquier app." },
             autostart: SurfaceStatus { state: "ok", note: "Arranque al iniciar sesión vía XDG autostart (.desktop)." },
@@ -188,7 +235,7 @@ fn surfaces_for(is_wayland: bool, is_hyprland: bool, is_gnome: bool, is_kde: boo
     if is_hyprland {
         return DesktopSurfaces {
             always_on_top: SurfaceStatus { state: "limited", note: "Hyprland aplica siempre-encima de forma estricta; si la tira se oculta, usa «Auto-hide»." },
-            click_through: SurfaceStatus { state: "ok", note: "El ratón atraviesa los huecos de la tira." },
+            click_through: SurfaceStatus { state: "limited", note: "Click-through del widget no implementado: el ratón no atraviesa la tira; solo el overlay de efectos lo usa." },
             tray_icon: SurfaceStatus { state: "limited", note: "Sin una barra que muestre AppIndicator, el icono no se ve: vuelve a abrir Quorb para recuperar la tira." },
             global_shortcuts: SurfaceStatus { state: "limited", note: "Los atajos globales dependen del registro por portal; si falla, el error se ve en Ajustes › Atajos." },
             autostart: SurfaceStatus { state: "ok", note: "Arranque al iniciar sesión vía XDG autostart (.desktop)." },
@@ -210,7 +257,7 @@ fn surfaces_for(is_wayland: bool, is_hyprland: bool, is_gnome: bool, is_kde: boo
     if is_kde {
         return DesktopSurfaces {
             always_on_top: SurfaceStatus { state: "ok", note: "KWin respeta siempre-encima." },
-            click_through: SurfaceStatus { state: "ok", note: "El ratón atraviesa los huecos de la tira." },
+            click_through: SurfaceStatus { state: "limited", note: "Click-through del widget no implementado: el ratón no atraviesa la tira; solo el overlay de efectos lo usa." },
             tray_icon: SurfaceStatus { state: "ok", note: "KDE soporta bandeja AppIndicator/StatusNotifier de forma nativa." },
             global_shortcuts: SurfaceStatus { state: "limited", note: "El registro puede denegarse en Wayland: el error se muestra en Ajustes › Atajos." },
             autostart: SurfaceStatus { state: "ok", note: "Arranque al iniciar sesión vía XDG autostart (.desktop)." },
@@ -222,7 +269,7 @@ fn surfaces_for(is_wayland: bool, is_hyprland: bool, is_gnome: bool, is_kde: boo
     // mientras la verificación no confirme cada compositor.
     DesktopSurfaces {
         always_on_top: SurfaceStatus { state: "limited", note: "El soporte de siempre-encima depende del compositor; si la tira se oculta, usa «Auto-hide»." },
-        click_through: SurfaceStatus { state: "ok", note: "El ratón atraviesa los huecos de la tira (según el compositor)." },
+        click_through: SurfaceStatus { state: "limited", note: "Click-through del widget no implementado: el ratón no atraviesa la tira; solo el overlay de efectos lo usa." },
         tray_icon: SurfaceStatus { state: "limited", note: "Solo se muestra el icono si la barra admite StatusNotifier/AppIndicator." },
         global_shortcuts: SurfaceStatus { state: "limited", note: "El registro puede denegarse en Wayland: el error se muestra en Ajustes › Atajos." },
         autostart: SurfaceStatus { state: "ok", note: "Arranque al iniciar sesión vía XDG autostart (.desktop)." },
@@ -242,29 +289,40 @@ pub fn detect_wm_info() -> WindowManagerInfo {
 fn is_wayland_only_session(token: &str) -> bool {
     matches!(
         token.trim().to_ascii_lowercase().as_str(),
-        "wayland" | "hyprland" | "sway" | "wlroots" | "niri" | "river" | "wayfire"
+        "wayland"
+            | "hyprland"
+            | "sway"
+            | "wlroots"
+            | "niri"
+            | "river"
+            | "wayfire"
+            | "labwc"
+            | "cosmic"
     )
 }
 
 /// Recomendación estática derivada del compositor detectado. Pura: el caller
-/// la copia al JSON sin hacer formatting (es &'static str).
+/// la copia al JSON sin hacer formatting (es &'static str). `is_kde` se recibe
+/// del mismo cálculo que `surfaces_for` (única fuente de verdad; no duplicar
+/// aquí el match de `desktop_session`).
 fn recommendation(
     is_wayland: bool,
     is_hyprland: bool,
+    is_kde: bool,
     desktop_session: Option<&str>,
-    xdg_current_desktop: Option<&str>,
+    _xdg_current_desktop: Option<&str>,
 ) -> &'static str {
     if is_hyprland {
         "Hyprland es particularmente estricto con always-on-top. \
          Si la tira se ve normal pero se oculta tras otras ventanas, \
          activa «Auto-hide» en Ajustes como Plan B."
     } else if is_wayland {
-        match (desktop_session, xdg_current_desktop) {
+        match (desktop_session, is_kde) {
             (Some(d), _) if d.eq_ignore_ascii_case("gnome") => {
                 "GNOME Wayland (Mutter) puede ignorar hints de always-on-top en \
                  algunos escenarios. La tira recurre a posición fija + skip_taskbar."
             }
-            (Some(d), _) if d.eq_ignore_ascii_case("kde-plasma") || d.eq_ignore_ascii_case("plasma") => {
+            (_, true) => {
                 "KDE Wayland suele respetar always-on-top; click-through puede \
                  fallar — usa la posición fija como fallback."
             }
@@ -288,7 +346,12 @@ pub fn get_wm_info() -> WindowManagerInfo {
 mod tests {
     use super::*;
 
-    fn env(wayland_display: Option<&str>, xdg_session_type: Option<&str>, desktop_session: Option<&str>, xdg_current_desktop: Option<&str>) -> Env {
+    fn env(
+        wayland_display: Option<&str>,
+        xdg_session_type: Option<&str>,
+        desktop_session: Option<&str>,
+        xdg_current_desktop: Option<&str>,
+    ) -> Env {
         Env {
             wayland_display: wayland_display.map(str::to_string),
             xdg_session_type: xdg_session_type.map(str::to_string),
@@ -332,8 +395,19 @@ mod tests {
 
     #[test]
     fn desktop_session_hyprland_signals_hyprland() {
+        // Solo DESKTOP_SESSION=hyprland sin XDG_SESSION_TYPE ni XDG_CURRENT_DESKTOP.
+        // Hyprland es un compositor Wayland-only, por lo que el usuario está
+        // en Wayland y `surfaces_for` debe tomar la rama Hyprland (no la X11).
         let info = detect_wm_info_from_env(&env(None, None, Some("hyprland"), None));
-        assert!(info.is_hyprland);
+        assert!(info.is_hyprland, "is_hyprland debe ser true");
+        assert!(info.is_wayland, "is_wayland debe ser true: Hyprland es solo-Wayland");
+        // Las superficies deben ser las de Hyprland: bandeja y always-on-top con `limited`.
+        assert_eq!(info.surfaces.always_on_top.state, "limited", "always_on_top limited en Hyprland");
+        assert_eq!(info.surfaces.tray_icon.state, "limited", "tray_icon limited en Hyprland");
+        assert!(info.surfaces.tray_icon.note.contains("vuelve a abrir Quorb"), "nota de tray en Hyprland");
+        assert_eq!(info.surfaces.click_through.state, "limited", "click_through limited en Hyprland");
+        assert_eq!(info.surfaces.global_shortcuts.state, "limited");
+        assert_eq!(info.surfaces.autostart.state, "ok");
     }
 
     #[test]
@@ -365,19 +439,34 @@ mod tests {
     fn gnome_xorg_is_not_wayland() {
         let info = detect_wm_info_from_env(&env(None, Some("x11"), Some("gnome"), Some("GNOME")));
         assert!(!info.is_wayland, "GNOME sobre Xorg no es Wayland");
-        assert!(info.recommendation.contains("completa"), "recomendación X11");
-        // Sesión X11: superficies completas esperadas.
+        assert!(
+            info.recommendation.contains("completa"),
+            "recomendación X11"
+        );
+        // Sesión X11: superficies completas esperadas (salvo click_through:
+        // el widget no implementa click-through hoy — solo el overlay de efectos).
         let surfaces: Vec<(&'static str, SurfaceStatus)> = info.surfaces.into_iter();
         for (name, status) in surfaces.iter() {
+            if *name == "click_through" {
+                assert_eq!(
+                    status.state, "limited",
+                    "click_through debe ser limited hasta implementar el widget"
+                );
+                continue;
+            }
             assert_eq!(status.state, "ok", "{name} debería estar ok en X11");
         }
     }
 
     #[test]
     fn plasma_x11_is_not_wayland() {
-        let info = detect_wm_info_from_env(&env(None, Some("x11"), Some("plasma"), Some("KDE:plasma")));
+        let info =
+            detect_wm_info_from_env(&env(None, Some("x11"), Some("plasma"), Some("KDE:plasma")));
         assert!(!info.is_wayland, "Plasma sobre X11 no es Wayland");
-        assert_eq!(info.surfaces.global_shortcuts.state, "ok", "atajos completos en X11");
+        assert_eq!(
+            info.surfaces.global_shortcuts.state, "ok",
+            "atajos completos en X11"
+        );
     }
 
     #[test]
@@ -390,20 +479,44 @@ mod tests {
     #[test]
     fn x11_surfaces_are_all_expected_complete() {
         let surfaces: Vec<(&'static str, SurfaceStatus)> =
-            detect_wm_info_from_env(&env(None, Some("x11"), Some("gnome-xorg-errors"), None)).surfaces.into_iter();
+            detect_wm_info_from_env(&env(None, Some("x11"), Some("gnome-xorg-errors"), None))
+                .surfaces
+                .into_iter();
         for (name, status) in surfaces.iter() {
+            // Click-through del widget es `limited` en todas las sesiones hoy:
+            // solo el overlay de efectos llama set_ignore_cursor_events, no la tira.
+            if *name == "click_through" {
+                assert_eq!(
+                    status.state, "limited",
+                    "click_through debe ser limited hasta implementar el widget"
+                );
+                continue;
+            }
             assert_eq!(status.state, "ok", "{name} debería estar ok en X11");
         }
         // Nota honesta sobre composición (la tira es transparente).
-        let transparency = surfaces.iter().find(|(n, _)| *n == "transparency").map(|(_, s)| s).unwrap();
+        let transparency = surfaces
+            .iter()
+            .find(|(n, _)| *n == "transparency")
+            .map(|(_, s)| s)
+            .unwrap();
         assert!(transparency.note.contains("composición"));
     }
 
     #[test]
     fn gnome_wayland_limits_tray_click_through_and_shortcuts() {
-        let s = detect_wm_info_from_env(&env(Some("wayland-0"), Some("wayland"), Some("gnome"), None)).surfaces;
+        let s = detect_wm_info_from_env(&env(
+            Some("wayland-0"),
+            Some("wayland"),
+            Some("gnome"),
+            None,
+        ))
+        .surfaces;
         assert_eq!(s.tray_icon.state, "limited");
-        assert!(s.tray_icon.note.contains("AppIndicator"), "debe decir cómo recuperar el icono");
+        assert!(
+            s.tray_icon.note.contains("AppIndicator"),
+            "debe decir cómo recuperar el icono"
+        );
         assert_eq!(s.click_through.state, "limited");
         assert_eq!(s.global_shortcuts.state, "limited");
         assert_eq!(s.always_on_top.state, "limited");
@@ -421,7 +534,8 @@ mod tests {
 
     #[test]
     fn hyprland_limits_always_on_top_and_tray() {
-        let s = detect_wm_info_from_env(&env(None, Some("wayland"), Some("hyprland"), None)).surfaces;
+        let s =
+            detect_wm_info_from_env(&env(None, Some("wayland"), Some("hyprland"), None)).surfaces;
         assert_eq!(s.always_on_top.state, "limited");
         assert_eq!(s.tray_icon.state, "limited");
         assert!(s.tray_icon.note.contains("vuelve a abrir Quorb"));
