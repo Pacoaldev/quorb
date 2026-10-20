@@ -12,7 +12,7 @@ describe('9Router custom node logo keys', () => {
     ).toBe('qwen-alibaba');
   });
 
-  it('resolves those names to a real logo file through aliases', () => {
+it('resolves those names to a real logo file through aliases', () => {
     expect(findLogo(subLogoKey('nine_router:anthropic-compatible-x', '9Router · Zhipu'))).toBeDefined();
     expect(findLogo(subLogoKey('nine_router:openai-compatible-responses-x', '9Router · QWEN - Alibaba'))).toBeDefined();
   });

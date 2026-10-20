@@ -11,3 +11,13 @@ docs/odd/
 # locales cuando alguien instala con pnpm por error.
 pnpm-lock.yaml
 pnpm-workspace.yaml
+
+# Devcontainer CLI: regenerado por `devcontainer up`, no se versiona.
+.devcontainer/devcontainer-lock.json
+
+# Diagnóstico de portabilidad Linux: caché del binario linuxdeploy descargado
+# por `.devcontainer/diagnose-linuxdeploy.sh`. No se versiona.
+.devcontainer/.diag/
+
+# Estado local de Claude Code (PRDs, planes, memoria de sesión). No versionado.
+.claude/

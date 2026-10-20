@@ -18,7 +18,10 @@ import { hiddenNineRouterIds, nineRouterSubName, revealIds } from './lib/visibil
 import { openAccountLogin } from './lib/account-login';
 import { createPresencePoller, effectivePersisted, isConnectionDirty } from './lib/account-health';
 import { createCodexInstallController, type CodexInstallController } from './lib/codex-install';
+import { keyringErrorHint } from './lib/keyring-message';
 import { comboFromEvent, prettyCombo } from './lib/shortcuts';
+import { detectWindowManager, type WindowManagerInfo } from './lib/wm-detect';
+import { desktopCompatRows, showDesktopCompat } from './lib/desktop-compat';
 import { ProviderLogo } from './components/ProviderLogo';
 import { CodexInstall } from './components/CodexInstall';
 import quorbLogo from './assets/quorb-logo.png';
@@ -68,10 +71,21 @@ function Section({ title, kicker, id, children }: { title: string; kicker?: stri
 function UpdatesSection({ auto, onAuto }: { auto: boolean; onAuto: (v: boolean) => void }) {
   const appName = useAppName();
   const [version, setVersion] = useState<string>('');
-  const { state, check, install } = useUpdater(auto);
+  const { mode, state, check, install } = useUpdater(auto);
   useEffect(() => {
     getVersion().then(setVersion).catch(() => setVersion('?'));
   }, []);
+
+  if (mode !== 'native') return (
+    <Section title="Versión actual">
+      <p className="q-note">{appName ?? '…'} <b>{version ? `v${version}` : ''}</b></p>
+      <p className="q-note" role="status">
+        {mode === 'manual' ? 'Actualización manual en macOS. No se buscan ni se instalan actualizaciones desde la app.'
+          : mode === 'error' ? 'No se pudo determinar el modo de actualización. Reinicia Quorb para reintentar.'
+          : 'Consultando el modo de actualización…'}
+      </p>
+    </Section>
+  );
 
   return (
     <Section title="Versión instalada">
@@ -183,10 +197,12 @@ function SecretInput({ id, label, configured, onSaved, hint }: { id: ScopedSecre
     try {
       await api.setSecret(id, v);
       setValue('');
-      setMsg(v ? 'Guardada en el Administrador de credenciales' : 'Eliminada');
+      setMsg(v ? 'Guardada en el almacén seguro del sistema' : 'Eliminada');
       onSaved();
     } catch (e) {
-      setMsg(String(e));
+      // Si el backend falla por falta de llavero (Secret Service / libsecret en
+      // Linux), muestra un mensaje accionable en vez del error técnico crudo.
+      setMsg(keyringErrorHint(e) ?? String(e));
     } finally {
       setBusy(false);
     }
@@ -300,7 +316,7 @@ function NanConnect({ connected, onChange, account }: { connected: boolean; onCh
       )}
       <small className="eg-field__hint">
         {msg ??
-          'Igual que «nan auth login --email»: NaN te manda un enlace de un solo uso. No lo abras en el navegador (se gastaría): cópialo y pégalo aquí. La sesión se guarda en el Administrador de credenciales de Windows y da los mismos datos que tu dashboard.'}
+          'Igual que «nan auth login --email»: NaN te manda un enlace de un solo uso. No lo abras en el navegador (se gastaría): cópialo y pégalo aquí. La sesión se guarda en el almacén de credenciales del sistema y da los mismos datos que tu dashboard.'}
       </small>
     </div>
   );
@@ -385,7 +401,7 @@ function NineRouterConnect({ connected, baseUrl, onChange }: { connected: boolea
         )}
       </div>
       <small className="eg-field__hint">
-        {msg ?? 'La contraseña del dashboard de 9Router (por defecto «123456» hasta que la cambies). Se guarda en el Administrador de credenciales de Windows.'}
+        {msg ?? 'La contraseña del dashboard de 9Router (por defecto «123456» hasta que la cambies). Se guarda en el almacén seguro del sistema.'}
       </small>
       {out && <pre className="q-pre">{out}</pre>}
     </details>
@@ -565,7 +581,7 @@ function CliMissing({ provider }: { provider: AccountProvider }) {
 type HealthProps = {
   /** Config guardada: cuando cambia (al guardar) se vuelve a comprobar. */
   saved: unknown;
-  /** Estado de las claves del Administrador de credenciales. */
+  /** Estado de las claves del almacén seguro del sistema. */
   secretsSig: string;
   /** Hay cambios sin guardar en esta cuenta: se comprueba lo guardado. */
   dirty: boolean;
@@ -575,6 +591,10 @@ type HealthProps = {
   saving: boolean;
   /** Guarda y confirma (`true`) si la config quedó persistida. */
   onSave: () => Promise<boolean>;
+  /** Si la cuenta tiene login por CLI, abre el login cuando el report viene con `needsLogin`. */
+  onLogin?: () => void;
+  /** `true` mientras `onLogin` está en curso: deshabilita el CTA (single-flight). */
+  loginBusy?: boolean;
 };
 
 type Health = { phase: 'checking' } | { phase: 'done'; report: UsageReport | null } | { phase: 'failed'; error: string };
@@ -594,7 +614,7 @@ function healthSummary(r: UsageReport): string {
  * Último paso de cada proveedor y cuenta: consulta la cuenta con lo guardado y dice si
  * funciona y, si no, por qué (sesión caducada, clave rechazada, falta un dato…).
  */
-function HealthStep({ id, saved, secretsSig, dirty, hidden, saving, onSave, refreshKey }: HealthProps & { id: string; refreshKey?: unknown }) {
+function HealthStep({ id, saved, secretsSig, dirty, hidden, saving, onSave, onLogin, loginBusy, refreshKey }: HealthProps & { id: string; refreshKey?: unknown }) {
   const [h, setH] = useState<Health>({ phase: 'checking' });
   const [busy, setBusy] = useState(false);
   const seq = useRef(0);
@@ -681,6 +701,16 @@ function HealthStep({ id, saved, secretsSig, dirty, hidden, saving, onSave, refr
         ) : (
           <button type="button" className="eg-btn eg-btn--ghost eg-btn--sm" disabled={state === 'checking'} onClick={run}>
             Comprobar ahora
+          </button>
+        )}
+        {state === 'warn' && r?.status === 'needsLogin' && onLogin && (
+          <button
+            type="button"
+            className="eg-btn eg-btn--primary eg-btn--sm"
+            disabled={busy || saving || loginBusy}
+            onClick={onLogin}
+          >
+            Iniciar sesión
           </button>
         )}
       </span>
@@ -789,7 +819,7 @@ function CliConnect({
         )}
       </li>
       {persisted ? (
-        <HealthStep id={id} {...health} refreshKey={connected} />
+        <HealthStep id={id} {...health} onLogin={connect} loginBusy={busy} refreshKey={connected} />
       ) : (
         <li>
           <b>Comprobación</b>
@@ -998,7 +1028,7 @@ function AccountEditor({
         <button type="button" className="eg-btn eg-btn--destructive eg-btn--sm" onClick={onRemove}>
           Eliminar esta cuenta
         </button>
-        <small className="eg-field__hint">Al guardar se borran también sus claves del Administrador de credenciales.</small>
+        <small className="eg-field__hint">Al guardar se borran también sus claves del almacén seguro del sistema.</small>
       </div>
     </Section>
   );
@@ -1281,6 +1311,17 @@ export function Settings() {
       autostartController.stop();
     };
   }, [autostartController]);
+
+  // Bloque «Sesión de escritorio» (solo Linux): informa de límites por superficie
+  // según el compositor detectado. El error de lectura se muestra silencioso
+  // (sin intervención): no es un ajuste, es un estado informativo.
+  const [wmInfo, setWmInfo] = useState<WindowManagerInfo | null>(null);
+  useEffect(() => {
+    if (!showDesktopCompat(navigator.userAgent)) return;
+    detectWindowManager()
+      .then(setWmInfo)
+      .catch(() => {}); // sin lectura (p. ej. sin entorno de escritorio): el bloque no aparece
+  }, []);
 
   // Ciclo de vida del componente: al desmontar se marca inactivo y se limpia el
   // timer de mensajes. Simétrico para StrictMode (setup/cleanup/setup).
@@ -1572,14 +1613,14 @@ export function Settings() {
                 disabled={autostartState.busy || autostartState.confirmed === null}
                 onChange={(e) => setAutostartDraft(e.target.checked)}
               />{' '}
-              Arrancar con Windows
+              Arrancar al iniciar sesión
             </label>
           </header>
 
           {autostartState.error && (
             <div className="eg-notice eg-notice--warning eg-notice--sm" role="alert">
               <span className="eg-notice__text">
-                {autostartState.confirmed === null ? 'No se pudo leer «Arrancar con Windows»: ' : ''}
+                {autostartState.confirmed === null ? 'No se pudo leer «Arrancar al iniciar sesión»: ' : ''}
                 {autostartState.error}
               </span>
               {autostartState.confirmed === null && (
@@ -1589,6 +1630,26 @@ export function Settings() {
                   </button>
                 </span>
               )}
+            </div>
+          )}
+
+          {wmInfo && (
+            <div className="eg-notice eg-notice--sm" role="status">
+              <span className="eg-notice__text">
+                <strong>
+                  Sesión de escritorio: {wmInfo.isWayland ? 'Wayland' : wmInfo.xdgSessionType ?? 'X11'}
+                  {wmInfo.desktopSession ? ` · ${wmInfo.desktopSession}` : ''}
+                </strong>
+              </span>
+              <p className="eg-notice__text">{wmInfo.recommendation}</p>
+              <ul style={{ margin: 0, paddingLeft: '1.2em' }}>
+                {desktopCompatRows(wmInfo.surfaces).map((row) => (
+                  <li key={row.label}>
+                    <strong>{row.label}</strong> ·{' '}
+                    {row.state === 'limited' ? <em>con límites:</em> : <em>sin límites conocidos:</em>} {row.note}
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
 
@@ -2077,6 +2138,7 @@ export function Settings() {
                 </Field>
                 <Rows>
                   <Toggle label="Círculos pequeños" hint="Un solo anillo por suscripción: el límite más cercano." checked={cfg.compact} onChange={(v) => liveChange({ compact: v })} />
+                  <Toggle label="Mostrar resets en los círculos" hint="El saldo de resets siempre sigue disponible en el panel de detalle." checked={cfg.showResets ?? true} onChange={(v) => liveChange({ showResets: v })} />
                 </Rows>
               </Section>
 
@@ -2115,7 +2177,7 @@ export function Settings() {
               <Section title="Cuándo avisar">
                 <Rows>
                   <Toggle label="Activar avisos" checked={cfg.alerts.enabled} onChange={(v) => set('alerts', { enabled: v })} />
-                  <Toggle label="Notificación de Windows" hint="Además del efecto en pantalla." checked={cfg.alerts.native} onChange={(v) => set('alerts', { native: v })} />
+                  <Toggle label="Notificación del sistema" hint="Además del efecto en pantalla." checked={cfg.alerts.native} onChange={(v) => set('alerts', { native: v })} />
                 </Rows>
                 <div className="q-moment">
                   <h3>1 · Al superar el límite</h3>

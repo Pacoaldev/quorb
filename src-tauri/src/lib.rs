@@ -2,11 +2,18 @@ mod channel;
 mod cli_process;
 mod codex_setup;
 mod config;
+mod config_transaction;
+mod detail_geometry;
 mod history;
 mod login;
 mod model;
 mod providers;
 mod secrets;
+mod wm_compat;
+mod uninstall;
+mod window_clip;
+#[cfg(target_os = "windows")]
+mod windows_backdrop;
 
 use config::AppConfig;
 use model::UsageReport;
@@ -30,6 +37,40 @@ const SETTINGS_HEIGHT: f64 = 920.0;
 const OVERLAY: &str = "overlay";
 const DETAIL: &str = "detail";
 const TRAY_ID: &str = "main";
+
+#[tauri::command]
+async fn set_surface_clip(window: WebviewWindow, clip: window_clip::Clip, backdrop: Option<bool>) -> Result<(), String> {
+    // Only plain wire geometry and a window handle cross the async boundary.
+    // The compositor, queue, visuals and completion actions stay on the UI thread.
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    let ui_window = window.clone();
+    window.run_on_main_thread(move || {
+        let result = window_clip::apply(&ui_window, clip, backdrop.unwrap_or(true));
+        // Cancellation needs no native cleanup: the UI-owned cache retains the layer.
+        let _ = tx.try_send(result);
+    }).map_err(|e| e.to_string())?;
+    rx.recv().await.ok_or_else(|| "Surface clip UI callback was dropped".to_string())?
+}
+
+#[tauri::command]
+async fn set_detail_bounds(window: WebviewWindow, bounds: detail_geometry::Bounds) -> Result<(), String> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    let ui_window = window.clone();
+    window.run_on_main_thread(move || {
+        let _ = tx.try_send(detail_geometry::apply(&ui_window, bounds));
+    }).map_err(|e| e.to_string())?;
+    rx.recv().await.ok_or_else(|| "Detail bounds UI callback was dropped".to_string())?
+}
+
+#[tauri::command]
+async fn set_widget_bounds(window: WebviewWindow, bounds: detail_geometry::Bounds) -> Result<(), String> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    let ui_window = window.clone();
+    window.run_on_main_thread(move || {
+        let _ = tx.try_send(detail_geometry::apply_widget(&ui_window, bounds));
+    }).map_err(|e| e.to_string())?;
+    rx.recv().await.ok_or_else(|| "Widget bounds UI callback was dropped".to_string())?
+}
 
 /// Atajos registrados → acción, y errores del último registro (para Ajustes).
 #[derive(Default)]
@@ -94,6 +135,11 @@ struct AppState {
     config_path: PathBuf,
     http: reqwest::Client,
     history: history::History,
+    /// Single-flight para aperturas de login CLI en curso. Protege contra
+    /// doble clic en «Iniciar sesión» (HealthStep/CliConnect) y contra reenvíos
+    /// duplicados: mientras un `provider` esté en este set, una segunda llamada
+    /// a `open_login` con el mismo id devuelve `Err` sin abrir una segunda terminal.
+    login_in_flight: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Resultado de un patch atómico. `native_error` describe un efecto nativo que
@@ -137,24 +183,39 @@ fn always_on_top_error(detail: &str) -> String {
 // ───────────────────────── comandos ─────────────────────────
 
 #[tauri::command]
+fn updater_mode() -> &'static str {
+    if cfg!(target_os = "macos") { "manual" } else { "native" }
+}
+
+#[tauri::command]
 fn get_config(state: State<'_, AppState>) -> AppConfig {
     state.config.lock().unwrap().clone()
 }
 
 /// Sustituye la config bajo el lock y la persiste en el mismo paso, para que
 /// `save_config` y `patch_config` no se pisen a medias (merge atómico).
-/// Devuelve (anterior, nueva). Los efectos secundarios van fuera del lock.
+/// Devuelve (anterior, nueva). La invalidación de credenciales y la publicación
+/// comparten el lock; los efectos de UI se aplican después de soltarlo.
 fn update_config(
     state: &AppState,
     mutate: impl FnOnce(&mut AppConfig),
 ) -> Result<(AppConfig, AppConfig), String> {
-    let mut guard = state.config.lock().unwrap();
-    let mut next = guard.clone();
-    mutate(&mut next);
-    let next = next.sanitized();
-    config::save(&state.config_path, &next)?;
-    let old = std::mem::replace(&mut *guard, next.clone());
-    Ok((old, next))
+    config_transaction::update(
+        &state.config,
+        |current| {
+            let mut next = current.clone();
+            mutate(&mut next);
+            next.sanitized()
+        },
+        |old, next| {
+            invalidate_nine_router_before_destination_publish(
+                &old.nine_router.base_url,
+                &next.nine_router.base_url,
+                forget_nine_router_secrets,
+            ).map(|_| ())
+        },
+        |next| config::save(&state.config_path, next),
+    )
 }
 
 #[tauri::command]
@@ -171,6 +232,7 @@ fn save_config(app: AppHandle, state: State<'_, AppState>, config: AppConfig) ->
     )?;
 
     let (old, config) = update_config(&state, |current| *current = config)?;
+    // La invalidación de 9Router ya ocurrió dentro de la transacción de config.
     // Las cuentas eliminadas se llevan sus secretos del almacén del sistema.
     for gone in old.accounts.iter().filter(|a| !config.accounts.iter().any(|b| b.id == a.id)) {
         secrets::forget_account(gone);
@@ -269,17 +331,16 @@ async fn nan_probe(state: State<'_, AppState>) -> Result<String, String> {
 /// stats en crudo (Ajustes › 9Router › Probar). `base_url` es la del borrador de
 /// Ajustes si el usuario la cambió sin guardar; si no, la persistida.
 ///
-/// Las credenciales (contraseña y cookie) son del servidor, no van asociadas a
-/// una URL en el almacén: por eso, si el borrador apunta a **otro** destino que
-/// el persistido, la prueba se hace con una **sesión temporal aislada** y no se
-/// guarda nada. Guardar la contraseña/cookie de B en los secretos globales sin
-/// actualizar la URL persistida de A (el borrador se puede descartar) dejaría a A
-/// autenticándose con credenciales de B: rompía la conexión anterior y enviaba
-/// las credenciales a un destino distinto. Solo se persiste cuando el destino
-/// probado coincide con el persistido.
+/// Las credenciales están vinculadas al servidor. Una prueba contra otro destino
+/// usa una sesión temporal aislada. Para persistir, config y ticket se capturan
+/// bajo el mismo lock que el guardado y logout; tras la red la generación debe
+/// seguir vigente. Ningún lock de configuración se mantiene durante el `.await`.
 #[tauri::command]
 async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password: String, base_url: Option<String>) -> Result<String, String> {
-    let cfg = state.config.lock().unwrap().clone();
+    let (cfg, ticket) = config_transaction::snapshot_with_ticket(
+        &state.config,
+        providers::nine_router_creds::begin_write_ticket,
+    );
     let saved_base = cfg.nine_router.base_url.trim();
     let draft_base = base_url
         .map(|u| u.trim().to_string())
@@ -288,7 +349,6 @@ async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password:
     if providers::nine_router::same_destination(saved_base, draft_base.as_deref()) {
         // Ticket antes del await: si hay logout / otro destino / otra conexión,
         // la respuesta de A no debe restaurar ni sobrescribir (persist_if_generation).
-        let ticket = providers::nine_router_creds::begin_write_ticket();
         let cookie = providers::nine_router::login(&state.http, &base, &password).await?;
         match providers::nine_router_creds::persist_if_generation(&base, &password, &cookie, ticket) {
             Ok(()) => {}
@@ -313,8 +373,8 @@ async fn nine_router_login(app: AppHandle, state: State<'_, AppState>, password:
 /// Desconecta 9Router: borra contraseña, cookie y vínculo al destino.
 /// Si el almacén no confirma el borrado, se propaga el error (no se informa éxito).
 #[tauri::command]
-fn nine_router_logout(app: AppHandle) -> Result<(), String> {
-    forget_nine_router_secrets()?;
+fn nine_router_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    config_transaction::with_locked(&state.config, forget_nine_router_secrets)?;
     let _ = app.emit("config-changed", ());
     // P2: desconectar también debe refrescar el widget al instante (misma razón
     // que en el login: la config no cambia, solo la sesión).
@@ -390,8 +450,12 @@ fn play_effect(app: AppHandle, state: State<'_, AppState>, req: EffectRequest) -
     }
     w.set_position(PhysicalPosition::new(req.x, req.y)).map_err(|e| e.to_string())?;
     w.set_size(PhysicalSize::new(req.width.max(1), req.height.max(1))).map_err(|e| e.to_string())?;
-    let _ = w.set_ignore_cursor_events(true);
+    // `show()` primero: tao 0.37.1 hace `window.window().unwrap()` en
+    // `set_ignore_cursor_events`, y hasta que la ventana se mapea (show) no
+    // existe el GdkWindow → panic en Wayland (tao#1204). Si el click-through
+    // no funciona, es un no-op silencioso (recomendación de `wm_compat`).
     w.show().map_err(|e| e.to_string())?;
+    let _ = w.set_ignore_cursor_events(true);
     app.emit_to(
         OVERLAY,
         "play-effect",
@@ -453,8 +517,20 @@ fn account_session(state: State<'_, AppState>, id: String) -> bool {
 
 #[tauri::command]
 fn open_login(state: State<'_, AppState>, provider: String) -> Result<(), String> {
+    // Single-flight: si hay una apertura en curso para este id, no abrir
+    // una segunda terminal (doble clic / reenvío del frontend).
+    // `unwrap_or_else(into_inner)`: si otro hanco pánicara con el lock tomado,
+    // el mutex queda envenenado y con `unwrap` todos los `open_login` futuros
+    // paniquearían en cascada. Con `into_inner` seguimos operando el set.
+    let mut inflight = state.login_in_flight.lock().unwrap_or_else(|p| p.into_inner());
+    if !inflight.insert(provider.clone()) {
+        return Err("Ya hay una apertura de terminal en curso para esta cuenta. Si no se abrió, inténtalo de nuevo.".into());
+    }
+    drop(inflight); // no mantener el lock mientras spawn_terminal corre
     let cfg = state.config.lock().unwrap().clone();
-    login::open(&provider, &cfg)
+    let r = login::open(&provider, &cfg);
+    state.login_in_flight.lock().unwrap_or_else(|p| p.into_inner()).remove(&provider);
+    r
 }
 
 /// Estado de solo lectura de la instalación asistida de Codex (sin procesos).
@@ -638,7 +714,10 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    if let Some(code) = uninstall::dispatch(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
+    let builder = tauri::Builder::default()
         // Debe ir el primero: si ya está abierta, muestra el widget existente.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window(WIDGET) {
@@ -648,8 +727,10 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init());
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    let builder = builder
         .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -673,6 +754,8 @@ pub fn run() {
             None,
         ))
         .setup(|app| {
+            #[cfg(target_os = "windows")]
+            windows_backdrop::initialize_ui_thread();
             let config_dir = app.path().app_config_dir()?;
             let data_dir = app.path().app_data_dir()?;
             migrate_legacy_dir(&config_dir, "config.json");
@@ -688,10 +771,16 @@ pub fn run() {
             if let Some(w) = app.get_webview_window(WIDGET) {
                 let _ = w.set_always_on_top(cfg.always_on_top);
             }
+            // En macOS una ventana queda clavada en su Space a menos que se marque
+            // «visible en todos los Spaces» (NSWindow.canJoinAllSpaces): sin esto la
+            // tira no sigue al usuario entre Spaces ni sobre apps fullscreen, y el
+            // detalle/overlay quedarían en otro Space distinto al de la tira.
+            // Windows/Linux no lo necesitan: no hay Spaces y siempre-encina ya
+            // cubre el caso.
             let history = history::History::load(data_dir.join("history.json"));
 
             // El detalle tiene su propia superficie: abrirlo nunca redimensiona la tira.
-            WebviewWindowBuilder::new(app, DETAIL, WebviewUrl::App("index.html".into()))
+            let detail_builder = WebviewWindowBuilder::new(app, DETAIL, WebviewUrl::App("index.html".into()))
                 .title(format!("{} · detalle", channel::current().name))
                 .inner_size(330.0, 260.0)
                 .decorations(false)
@@ -701,11 +790,13 @@ pub fn run() {
                 .skip_taskbar(true)
                 .resizable(false)
                 .focused(false)
-                .visible(false)
-                .build()?;
+                .visible(false);
+            #[cfg(target_os = "windows")]
+            let detail_builder = detail_builder.no_redirection_bitmap(true);
+            detail_builder.build()?;
 
             // Ventana de efectos: transparente, sin foco, encima de todo y sin capturar el ratón.
-            let overlay = WebviewWindowBuilder::new(app, OVERLAY, WebviewUrl::App("index.html".into()))
+            let _overlay = WebviewWindowBuilder::new(app, OVERLAY, WebviewUrl::App("index.html".into()))
                 .title(format!("{} · efectos", channel::current().name))
                 .decorations(false)
                 .transparent(true)
@@ -717,7 +808,21 @@ pub fn run() {
                 .focusable(false)
                 .visible(false)
                 .build()?;
-            let _ = overlay.set_ignore_cursor_events(true);
+            // Sin `set_ignore_cursor_events` aquí: la ventana aún está oculta
+            // y no tiene GdkWindow → tao 0.37.1 panicea (`window.window()
+            // .unwrap()` en `CursorIgnoreEvents`, bug tao#1204). Se aplica en
+            // `play_effect()` después de `show()`.
+
+            // Se aplica tras construir DETAIL y OVERLAY: si corre antes, esos dos
+            // get_webview_window devuelven None y quedan clavados a su Space.
+            #[cfg(target_os = "macos")]
+            for label in [WIDGET, DETAIL, OVERLAY] {
+                if let Some(w) = app.get_webview_window(label) {
+                    if let Err(e) = w.set_visible_on_all_workspaces(true) {
+                        eprintln!("No pude marcar «{label}» visible en todos los Spaces: {e}");
+                    }
+                }
+            }
 
             app.manage(Shortcuts::default());
             app.manage(codex_setup::CodexSetupState::default());
@@ -727,11 +832,14 @@ pub fn run() {
                 config_path,
                 http,
                 history,
+                login_in_flight: Mutex::new(std::collections::HashSet::new()),
             });
             build_tray(app)?;
             Ok(())
         })
         .on_window_event(|window, event| {
+            #[cfg(target_os = "windows")]
+            windows_backdrop::on_window_event(window, event);
             // Cerrar el widget lo oculta; la app sigue en la bandeja.
             if window.label() == WIDGET {
                 if let WindowEvent::CloseRequested { api, .. } = event {
@@ -749,6 +857,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            updater_mode,
             get_config,
             save_config,
             patch_config,
@@ -764,6 +873,9 @@ pub fn run() {
             check_provider,
             open_settings,
             show_detail,
+            set_detail_bounds,
+            set_widget_bounds,
+            set_surface_clip,
             set_tray_tooltip,
             get_history,
             nan_probe,
@@ -774,9 +886,21 @@ pub fn run() {
             play_effect,
             overlay_done,
             shortcut_errors,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error al arrancar Quorb");
+            wm_compat::get_wm_info,
+        ]);
+    #[cfg(target_os = "windows")]
+    {
+        let app = builder.build(tauri::generate_context!()).expect("error al arrancar Quorb");
+        let exit_code = app.run_return(|_, event| {
+            if matches!(event, tauri::RunEvent::Exit) { windows_backdrop::begin_shutdown(); }
+        });
+        // Tauri has returned its UI thread to us. Finish an owned queue shutdown
+        // with a bounded native message pump, then release our WinRT apartment.
+        windows_backdrop::finish_shutdown();
+        if exit_code != 0 { std::process::exit(exit_code); }
+    }
+    #[cfg(not(target_os = "windows"))]
+    builder.run(tauri::generate_context!()).expect("error al arrancar Quorb");
 }
 
 #[cfg(test)]
@@ -784,6 +908,13 @@ mod tests {
     use super::*;
     use crate::config::Account;
 
+    #[test]
+    fn updater_policy_matches_compiled_target() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(updater_mode(), "manual");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(updater_mode(), "native");
+    }
     /// P1 (4º feedback): guardar una Base URL de 9Router distinta invalida los
     /// secretos del destino anterior. Sin esto, el siguiente fetch enviaría la
     /// cookie de A a B (o al revés), rompiendo la conexión anterior y exponiendo

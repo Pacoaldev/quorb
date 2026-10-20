@@ -28,8 +28,11 @@ describe('9Router disconnect', () => {
     expect(libSource).toContain('nine_router_destination_changed');
     expect(libSource).toContain('forget_nine_router_secrets');
     expect(libSource).toContain('invalidate_nine_router_before_destination_publish');
-    expect(libSource).toContain('forget_nine_router_secrets()?');
     expect(libSource).toContain('nine_router_creds::forget_all');
+    expect(libSource).toContain('config_transaction::update(');
+    expect(libSource).toContain('config_transaction::with_locked(&state.config, forget_nine_router_secrets)?');
+    // Solo wiring: las carreras de la frontera compartida se ejecutan en los tests Rust.
+    expect(libSource).toContain('config_transaction::snapshot_with_ticket(');
     expect(libSource).toContain('begin_write_ticket');
     expect(libSource).toContain('persist_if_generation');
   });
